@@ -10,8 +10,8 @@ import hashlib
 from urllib.parse import urlencode
 
 # 配置
-API_KEY = "dxubGWbnYJ5QzMdaOwBksMBn7rT6nr2h6JBXAtRiKCrFMe4gVEXyyyEEYjPmSloi"
-SECRET_KEY = "xDnOhW5D4dRUVUqKqWigcgOqmGrWg4byxJISSL4eUi0FkRy6o1cP8jelLebXsb75"
+API_KEY = "AR2vjxH5GfQ1ZXN9q70Iu65kCHygxEF8X205a9KZbU8lLpmMt10q9hthSbH7U74D"
+SECRET_KEY = "KhnbDEPhCU5qzdGNHlTb2KUw7qeft7XYVis8kGZS0VXgQBwsCzvoC6y0o6CQayvO"
 BASE_URL = "https://testnet.binancefuture.com"
 
 def create_signature(params):
@@ -116,10 +116,10 @@ def test_3_close_position(position):
         # 准备平仓参数
         params = {
             'symbol': 'ETHUSDT',
-            'side': side,
+            'side': 'SELL',  # 0.202 ETH 多头，卖出平仓
+            'positionSide': 'LONG',  # 必填：双向模式下平多
             'type': 'MARKET',
-            'quantity': quantity,
-            'reduceOnly': 'true',  # 只减仓，不平仓
+            'quantity': 0.202,
             'timestamp': int(time.time() * 1000)
         }
         

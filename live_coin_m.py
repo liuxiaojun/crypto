@@ -1,0 +1,4042 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+币本位（COIN-M）交割跨期实盘
+
+按币安 dapi 反向合约记账与下单：
+- 保证金、盈亏为结算币（BTC/ETH/SOL 等），不是 USDT
+- 下单单位为「张」（整数）；BTC 1 张=100 USD，其余主流 1 张=10 USD
+- 仅同币当季 vs 次季（两腿同一结算币）
+- 近月到期前默认 7 天禁开、3 天强制两腿平仓；缺腿有仓时用最近有效价平掉
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, timezone
+import warnings
+import time
+import threading
+import json
+import requests
+import hmac
+import hashlib
+import urllib.parse
+from urllib.parse import urlencode
+from flask import Flask, jsonify, request, render_template, redirect, url_for, session, flash
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3
+from functools import wraps
+from typing import Dict, List, Tuple, Any, Optional
+from decimal import Decimal, ROUND_HALF_UP
+from statsmodels.tsa.stattools import adfuller
+
+warnings.filterwarnings('ignore')
+
+# 尝试导入ARIMA和GARCH相关库
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+
+    ARIMA_AVAILABLE = True
+except ImportError:
+    ARIMA_AVAILABLE = False
+    print("警告: statsmodels未安装或版本过低，ARIMA功能将不可用。可以使用: pip install statsmodels")
+
+try:
+    from arch import arch_model
+
+    GARCH_AVAILABLE = True
+except ImportError:
+    GARCH_AVAILABLE = False
+    print("警告: arch未安装，GARCH功能将不可用。可以使用: pip install arch")
+
+# 导入Z-score策略
+try:
+    from strategies import TraditionalZScoreStrategy, ArimaGarchZScoreStrategy, EcmZScoreStrategy, \
+        KalmanFilterZScoreStrategy, CopulaDccGarchZScoreStrategy, RegimeSwitchingZScoreStrategy, BaseZScoreStrategy
+
+    STRATEGIES_AVAILABLE = True
+except ImportError:
+    STRATEGIES_AVAILABLE = False
+    print("警告: 策略模块导入失败，将使用内置方法")
+
+# statsmodels 基础库可用性（用于ECM、Regime-Switching等）
+try:
+    from statsmodels.regression.linear_model import OLS
+    from statsmodels.tools import add_constant
+
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    STATSMODELS_AVAILABLE = False
+    print("警告: statsmodels未安装，ECM和Regime-Switching功能将不可用")
+
+# ==================== 币安API配置 ====================
+
+# API配置（请修改为您的实际API密钥）
+API_KEY = "ZvJOtao1z4MktIjXue9qcJjRDMvZ5kL94rcF5tHnZcNw747iWxRDojslVMV8ZpVt"
+SECRET_KEY = "idr9iHAmV3aOUubPkgDZggiXxyjjcq3859sWkMVW4e6A95rwM1hNtqTF57SpvVLx"
+# 币本位：测试网用 testnet + /dapi/v1；正式盘 base 改为 https://dapi.binance.com
+BASE_URL = "https://testnet.binancefuture.com"
+DAPI_PREFIX = "/dapi/v1"
+DAPI_EXCHANGE_INFO_FALLBACK = "https://dapi.binance.com/dapi/v1/exchangeInfo"
+
+COIN_M_CONTRACT_SIZE = {
+    'BTC': 100.0,
+    'ETH': 10.0,
+    'BNB': 10.0,
+    'SOL': 10.0,
+    'XRP': 10.0,
+}
+COIN_M_MAINTENANCE_MARGIN_RATE = 0.005
+
+
+def parse_coin_m_base(symbol: str) -> str:
+    s = str(symbol).upper().replace('/', '').replace('-', '')
+    pair = s.split('_')[0]
+    if pair.endswith('USDT'):
+        return pair[:-4]
+    if pair.endswith('USD'):
+        return pair[:-3]
+    return pair
+
+
+def parse_delivery_expiry_date(symbol: str):
+    s = str(symbol).upper().replace('/', '').replace('-', '')
+    if "_" not in s:
+        return None
+    yymmdd = s.split("_", 1)[1]
+    if len(yymmdd) != 6 or not yymmdd.isdigit():
+        return None
+    try:
+        return datetime.strptime(yymmdd, "%y%m%d").date()
+    except ValueError:
+        return None
+
+
+def pair_near_expiry_date(symbol1: str, symbol2: str):
+    dates = [
+        d for d in (parse_delivery_expiry_date(symbol1), parse_delivery_expiry_date(symbol2))
+        if d is not None
+    ]
+    return min(dates) if dates else None
+
+
+def calendar_days_to_expiry(timestamp, expiry_date):
+    if expiry_date is None:
+        return None
+    ts = pd.Timestamp(timestamp)
+    return (expiry_date - ts.date()).days
+
+
+def coin_m_contract_size(symbol_or_base: str) -> float:
+    return float(COIN_M_CONTRACT_SIZE.get(parse_coin_m_base(symbol_or_base), 10.0))
+
+
+def inverse_pnl_coin(n_signed, contract_size, entry_price, exit_price) -> float:
+    if n_signed == 0 or entry_price <= 0 or exit_price <= 0 or contract_size <= 0:
+        return 0.0
+    return float(n_signed) * float(contract_size) * (1.0 / float(entry_price) - 1.0 / float(exit_price))
+
+
+def inverse_fee_coin(n_abs, contract_size, price, fee_rate) -> float:
+    if n_abs <= 0 or contract_size <= 0 or price <= 0:
+        return 0.0
+    return abs(n_abs) * contract_size / price * fee_rate
+
+
+def inverse_margin_coin(n_abs, contract_size, price, leverage) -> float:
+    if n_abs <= 0 or contract_size <= 0 or price <= 0 or leverage <= 0:
+        return 0.0
+    return abs(n_abs) * contract_size / (price * leverage)
+
+
+def dapi_asset_balance(account_info, asset: str) -> float:
+    """从 dapi account.assets 取某结算币可用余额。"""
+    if not account_info or not asset:
+        return 0.0
+    want = str(asset).upper()
+    for item in account_info.get('assets') or []:
+        if str(item.get('asset', '')).upper() == want:
+            for key in ('availableBalance', 'walletBalance', 'marginBalance'):
+                if item.get(key) is not None:
+                    try:
+                        return float(item[key])
+                    except (TypeError, ValueError):
+                        continue
+    if 'availableBalance' in account_info:
+        try:
+            return float(account_info.get('availableBalance') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def dapi_wallet_balance(account_info, asset: str) -> float:
+    if not account_info or not asset:
+        return 0.0
+    want = str(asset).upper()
+    for item in account_info.get('assets') or []:
+        if str(item.get('asset', '')).upper() == want:
+            try:
+                return float(item.get('walletBalance') or item.get('marginBalance') or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    if 'totalWalletBalance' in account_info:
+        try:
+            return float(account_info.get('totalWalletBalance') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+class BinanceAPI:
+    """币安API客户端"""
+
+    def __init__(self, api_key=API_KEY, secret_key=SECRET_KEY, base_url=BASE_URL):
+        """
+        初始化币安API客户端
+
+        Args:
+            api_key: API密钥
+            secret_key: 密钥
+            base_url: API基础URL
+        """
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.base_url = base_url.rstrip('/')
+        # 是否双向持仓：None 表示尚未成功查询，True/False 为缓存结果
+        self._dual_side_position_cached = None
+
+    def _dapi_url(self, path: str) -> str:
+        """path 如 /ticker/price、/order。"""
+        if not path.startswith('/'):
+            path = '/' + path
+        return f"{self.base_url}{DAPI_PREFIX}{path}"
+
+    def is_dual_side_position(self):
+        """
+        查询币本位合约是否为「双向持仓」(Hedge)。
+        双向模式下下单必须带 positionSide；单向模式下不能带。
+        """
+        if self._dual_side_position_cached is not None:
+            return self._dual_side_position_cached
+        try:
+            url = self._dapi_url('/positionSide/dual')
+            params = {'timestamp': int(time.time() * 1000)}
+            query_string = urlencode(params)
+            signature = self._generate_signature(query_string)
+            params['signature'] = signature
+            response = requests.get(url, params=params, headers=self._get_headers(), timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                self._dual_side_position_cached = bool(data.get('dualSidePosition', False))
+                if self._dual_side_position_cached:
+                    print("  [币安] 检测到双向持仓模式，下单将自动附带 positionSide")
+                return self._dual_side_position_cached
+            print(f"  [警告] 查询持仓模式失败 HTTP {response.status_code}，暂按单向持仓处理")
+        except Exception as e:
+            print(f"  [警告] 查询持仓模式异常: {e}，暂按单向持仓处理")
+        self._dual_side_position_cached = False
+        return False
+
+    def _generate_signature(self, query_string):
+        """生成签名"""
+        return hmac.new(
+            self.secret_key.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+    def _get_headers(self):
+        """获取请求头"""
+        return {
+            'X-MBX-APIKEY': self.api_key,
+            'Content-Type': 'application/json'
+        }
+
+    def get_current_price(self, symbol):
+        """获取当前价格"""
+        try:
+            url = self._dapi_url('/ticker/price')
+            params = {'symbol': symbol}
+            response = requests.get(url, params=params, timeout=5)
+
+            if response.status_code == 200:
+                data = response.json()
+                return float(data['price'])
+            else:
+                print(f"获取价格失败: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"获取价格异常: {str(e)}")
+            return None
+
+    def get_klines(self, symbol, interval='1h', limit=100):
+        """获取K线数据"""
+        try:
+            url = self._dapi_url('/klines')
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'limit': limit
+            }
+            response = requests.get(url, params=params, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                klines = []
+                for kline in data:
+                    klines.append({
+                        'timestamp': datetime.fromtimestamp(kline[0] / 1000),
+                        'open': float(kline[1]),
+                        'high': float(kline[2]),
+                        'low': float(kline[3]),
+                        'close': float(kline[4]),
+                        'volume': float(kline[5])
+                    })
+                return klines
+            else:
+                print(f"获取K线数据失败: {response.status_code} - {response.text}")
+                return []
+        except Exception as e:
+            print(f"获取K线数据异常: {str(e)}")
+            return []
+
+    def place_order(self, symbol, side, quantity, order_type='MARKET', position_side=None):
+        """
+        下单（自动适配单向/双向持仓，与 basic_binance_test(testApi_open).py 一致）
+
+        Args:
+            position_side: 双向持仓时必用 'LONG' 或 'SHORT'。
+                - 开仓：BUY 一般配 LONG，SELL 配 SHORT（不传则按此默认）。
+                - 平仓：平空为 BUY+SHORT，平多为 SELL+LONG，须由调用方显式传入。
+        """
+        try:
+            url = self._dapi_url('/order')
+
+            # 构建参数（币本位 quantity 为张数，必须是整数）
+            qty = int(round(float(quantity)))
+            if qty < 1:
+                print(f"下单失败: 张数必须 >= 1，收到 {quantity}")
+                return None
+            params = {
+                'symbol': symbol,
+                'side': side,  # 'BUY' or 'SELL'
+                'type': order_type,
+                'quantity': str(qty),
+                'timestamp': int(time.time() * 1000)
+            }
+
+            if self.is_dual_side_position():
+                ps = position_side
+                if ps is None:
+                    # 仅适合「开多/开空」：买开 → LONG，卖开 → SHORT
+                    ps = 'LONG' if side == 'BUY' else 'SHORT'
+                params['positionSide'] = ps
+
+            # 生成签名
+            query_string = urlencode(params)
+            signature = self._generate_signature(query_string)
+            params['signature'] = signature
+
+            # 发送请求
+            response = requests.post(url, params=params, headers=self._get_headers(), timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"下单成功: {symbol} {side} {quantity} - OrderID: {data.get('orderId')}")
+                return data
+            else:
+                print(f"下单失败: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"下单异常: {str(e)}")
+            return None
+
+    def get_account_info(self):
+        """获取账户信息"""
+        try:
+            url = self._dapi_url('/account')
+
+            # 构建参数
+            params = {
+                'timestamp': int(time.time() * 1000)
+            }
+
+            # 生成签名
+            query_string = urlencode(params)
+            signature = self._generate_signature(query_string)
+            params['signature'] = signature
+
+            # 发送请求
+            response = requests.get(url, params=params, headers=self._get_headers(), timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                return data
+            else:
+                print(f"获取账户信息失败: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"获取账户信息异常: {str(e)}")
+            return None
+
+    def get_position_info(self, symbol=None):
+        """获取持仓信息"""
+        try:
+            url = self._dapi_url('/positionRisk')
+
+            # 构建参数
+            params = {
+                'timestamp': int(time.time() * 1000)
+            }
+            if symbol:
+                params['symbol'] = symbol
+
+            # 生成签名
+            query_string = urlencode(params)
+            signature = self._generate_signature(query_string)
+            params['signature'] = signature
+
+            # 发送请求
+            response = requests.get(url, params=params, headers=self._get_headers(), timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                return data
+            else:
+                print(f"获取持仓信息失败: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"获取持仓信息异常: {str(e)}")
+            return None
+
+    def get_exchange_info(self):
+        """获取交易对信息（币本位 dapi；测试网失败时回退主网 exchangeInfo 仅用于精度）"""
+        try:
+            url = self._dapi_url('/exchangeInfo')
+            response = requests.get(url, timeout=10)
+
+            if response.status_code == 200:
+                return response.json()
+            print(f"获取交易对信息失败: {response.status_code} - {response.text}")
+            fb = requests.get(DAPI_EXCHANGE_INFO_FALLBACK, timeout=10)
+            if fb.status_code == 200:
+                print("  已改用主网 dapi exchangeInfo 读取合约精度")
+                return fb.json()
+            return None
+        except Exception as e:
+            print(f"获取交易对信息异常: {str(e)}")
+            try:
+                fb = requests.get(DAPI_EXCHANGE_INFO_FALLBACK, timeout=10)
+                if fb.status_code == 200:
+                    return fb.json()
+            except Exception:
+                pass
+            return None
+
+    def get_symbol_precision(self, symbol):
+        """获取交易对的精度信息"""
+        try:
+            exchange_info = self.get_exchange_info()
+            if exchange_info:
+                for symbol_info in exchange_info['symbols']:
+                    if symbol_info['symbol'] == symbol:
+                        for filter_info in symbol_info['filters']:
+                            if filter_info['filterType'] == 'LOT_SIZE':
+                                step_size = float(filter_info['stepSize'])
+                                return step_size
+            return 1.0  # 币本位默认 1 张
+        except Exception as e:
+            print(f"获取 {symbol} 精度信息异常: {str(e)}")
+            return 1.0
+
+    def get_order_status(self, order_id, symbol):
+        """查询订单状态"""
+        try:
+            url = self._dapi_url('/order')
+
+            # 构建参数
+            params = {
+                'symbol': symbol,
+                'orderId': order_id,
+                'timestamp': int(time.time() * 1000)
+            }
+
+            # 生成签名
+            query_string = urlencode(params)
+            signature = self._generate_signature(query_string)
+            params['signature'] = signature
+
+            # 发送请求
+            response = requests.get(url, params=params, headers=self._get_headers(), timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                return data
+            else:
+                print(f"查询订单状态失败: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            print(f"查询订单状态异常: {str(e)}")
+            return None
+
+
+# ==================== K线边界对齐工具函数 ====================
+
+def get_seconds_until_next_kline_boundary(interval: str, buffer_seconds: int = 5) -> float:
+    """
+    计算距离下一个K线收盘边界的秒数（用于在整点附近更新数据）
+
+    Binance使用UTC时间，K线在整点/整5分钟等边界收盘。
+    增加buffer_seconds是为了确保交易所已将该K线数据最终化后再请求。
+
+    Args:
+        interval: K线周期，如 '1m', '5m', '15m', '30m', '1h', '4h', '1d'
+        buffer_seconds: K线收盘后等待的缓冲秒数（默认5秒）
+
+    Returns:
+        float: 需要等待的秒数
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    if interval == '1m':
+        # 下一分钟整（如 10:23:xx -> 10:24:00）
+        next_boundary = (now_utc + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    elif interval == '5m':
+        # 下一个5分钟整点 (:00, :05, :10, ...)
+        next_minute = ((now_utc.minute // 5) + 1) * 5
+        if next_minute >= 60:
+            next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(minute=next_minute, second=0, microsecond=0)
+    elif interval == '15m':
+        # 下一个15分钟整点 (:00, :15, :30, :45)
+        next_minute = ((now_utc.minute // 15) + 1) * 15
+        if next_minute >= 60:
+            next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(minute=next_minute, second=0, microsecond=0)
+    elif interval == '30m':
+        # 下一个30分钟整点 (:00, :30)
+        next_minute = 30 if now_utc.minute < 30 else 0
+        if next_minute == 0:
+            next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(minute=30, second=0, microsecond=0)
+    elif interval == '1h':
+        # 下一小时整
+        next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    elif interval == '4h':
+        # 4小时K线: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+        next_hour = ((now_utc.hour // 4) + 1) * 4
+        if next_hour >= 24:
+            next_boundary = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_boundary = now_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+    elif interval == '1d':
+        # 日线: 每日 00:00 UTC
+        next_boundary = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        # 未知周期，使用1小时作为默认
+        next_boundary = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+
+    # 加上缓冲时间，确保K线数据已最终化
+    target_time = next_boundary + timedelta(seconds=buffer_seconds)
+    wait_seconds = (target_time - now_utc).total_seconds()
+
+    # 确保至少等待1秒，避免过于频繁请求
+    return max(1.0, wait_seconds)
+
+
+# ==================== 实时数据管理 ====================
+
+class RealTimeDataManager:
+    """实时数据管理器"""
+
+    def __init__(self, binance_api):
+        self.binance_api = binance_api
+        self.data_cache = {}
+        self.running = False
+        self.update_thread = None
+
+    def start_data_collection(self, symbols, interval='1h'):
+        """开始数据收集"""
+        self.symbols = symbols
+        self.interval = interval
+        self.running = True
+
+        # 启动数据更新线程
+        self.update_thread = threading.Thread(target=self._update_data_loop)
+        self.update_thread.daemon = True
+        self.update_thread.start()
+
+        print(f"开始收集实时数据: {symbols}")
+
+    def stop_data_collection(self):
+        """停止数据收集"""
+        self.running = False
+        if self.update_thread:
+            self.update_thread.join()
+        print("停止数据收集")
+
+    def _update_data_loop(self):
+        """
+        数据更新循环（对齐K线整点）
+
+        在每次K线收盘后立即更新数据，确保交易时机与参数优化时的逻辑一致。
+        例如1h周期：在 11:00:05、12:00:05、13:00:05... 更新（整点后5秒缓冲）
+        """
+        first_run = True
+        while self.running:
+            try:
+                # 获取K线数据
+                for symbol in self.symbols:
+                    klines = self.binance_api.get_klines(symbol, self.interval, 100)
+                    if klines:
+                        df = pd.DataFrame(klines)
+                        df.set_index('timestamp', inplace=True)
+                        self.data_cache[symbol] = df['close']
+
+                now_utc = datetime.now(timezone.utc)
+                if first_run:
+                    print(f"  [数据更新] 初始数据已加载 ({now_utc.strftime('%H:%M:%S')} UTC)")
+                    first_run = False
+
+                # 计算距离下一个K线边界的等待时间（对齐整点）
+                wait_seconds = get_seconds_until_next_kline_boundary(self.interval, buffer_seconds=5)
+
+                # 分段sleep，以便能响应running=False的停止信号
+                sleep_interval = 1.0  # 每秒检查一次
+                total_waited = 0.0
+                while total_waited < wait_seconds and self.running:
+                    time.sleep(min(sleep_interval, wait_seconds - total_waited))
+                    total_waited += sleep_interval
+
+                if not self.running:
+                    break
+
+            except Exception as e:
+                print(f"数据更新异常: {str(e)}")
+                time.sleep(10)
+
+    def get_current_data(self):
+        """获取当前数据"""
+        return self.data_cache.copy()
+
+    def get_current_prices(self):
+        """获取当前价格（实时价格，用于监控）"""
+        prices = {}
+        for symbol in self.symbols:
+            price = self.binance_api.get_current_price(symbol)
+            if price:
+                prices[symbol] = price
+        return prices
+
+    def get_latest_closed_kline_prices(self):
+        """获取最新已收盘K线的收盘价（用于交易决策）"""
+        prices = {}
+        for symbol in self.symbols:
+            if symbol in self.data_cache and len(self.data_cache[symbol]) > 0:
+                # 获取最后一个K线的收盘价（已收盘的K线）
+                prices[symbol] = self.data_cache[symbol].iloc[-1]
+        return prices
+
+    def get_latest_closed_kline_timestamp(self):
+        """获取最新已收盘K线的时间戳"""
+        latest_timestamp = None
+        for symbol in self.symbols:
+            if symbol in self.data_cache and len(self.data_cache[symbol]) > 0:
+                timestamp = self.data_cache[symbol].index[-1]
+                if latest_timestamp is None or timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+        return latest_timestamp
+
+    def collect_warmup_data(self, symbols, interval='1h', warmup_period=70):
+        """
+        收集预热数据
+
+        Args:
+            symbols: 交易对列表
+            interval: K线间隔
+            warmup_period: 预热期长度（数据点数量）
+
+        Returns:
+            dict: 预热数据字典
+        """
+        print(f"\n开始收集预热数据（需要 {warmup_period} 个数据点）...")
+        warmup_data = {}
+
+        for symbol in symbols:
+            print(f"  收集 {symbol} 的预热数据...")
+            klines = self.binance_api.get_klines(symbol, interval, warmup_period)
+            if klines:
+                df = pd.DataFrame(klines)
+                df.set_index('timestamp', inplace=True)
+                warmup_data[symbol] = df['close']
+                print(f"     {symbol}: {len(warmup_data[symbol])} 个数据点")
+            else:
+                print(f"     {symbol}: 数据收集失败")
+
+        # 检查数据是否足够
+        min_length = min([len(data) for data in warmup_data.values()]) if warmup_data else 0
+        if min_length < warmup_period:
+            print(f"警告: 预热数据不足，只收集到 {min_length} 个数据点（需要 {warmup_period} 个）")
+        else:
+            print(f" 预热数据收集完成，每个交易对 {min_length} 个数据点")
+
+        return warmup_data
+
+
+# ==================== RLS（递归最小二乘）类 ====================
+
+class RecursiveLeastSquares:
+    """
+    递归最小二乘（RLS）类，用于动态更新对冲比率
+    模型：price1_t = β_t * price2_t + ε_t
+    """
+
+    def __init__(self, lambda_forgetting=0.99, initial_covariance=1000.0, max_change_rate=0.2):
+        """
+        初始化RLS
+
+        Args:
+            lambda_forgetting: 遗忘因子（0 < λ ≤ 1），接近1表示更重视历史数据
+            initial_covariance: 初始协方差矩阵的对角元素（大的正数）
+            max_change_rate: 对冲比率最大变化率（防止突变）
+        """
+        self.lambda_forgetting = lambda_forgetting
+        self.initial_covariance = initial_covariance
+        self.max_change_rate = max_change_rate
+
+        # RLS状态
+        self.beta = None  # 对冲比率 [截距, 斜率]
+        self.P = None  # 协方差矩阵
+        self.initialized = False
+
+        # 历史记录
+        self.beta_history = []  # 历史对冲比率
+        self.change_history = []  # 历史变化率
+
+    def initialize(self, initial_price1, initial_price2):
+        """
+        使用初始数据初始化RLS
+
+        Args:
+            initial_price1: 初始价格序列1（用于OLS估计初始值）
+            initial_price2: 初始价格序列2
+        """
+        if len(initial_price1) < 10 or len(initial_price2) < 10:
+            raise ValueError("初始化需要至少10个数据点")
+
+        # 使用OLS估计初始对冲比率
+        min_length = min(len(initial_price1), len(initial_price2))
+        price1_aligned = initial_price1.iloc[:min_length] if hasattr(initial_price1, 'iloc') else initial_price1[
+                                                                                                  :min_length]
+        price2_aligned = initial_price2.iloc[:min_length] if hasattr(initial_price2, 'iloc') else initial_price2[
+                                                                                                  :min_length]
+
+        X = price2_aligned.values.reshape(-1, 1)
+        y = price1_aligned.values
+        X_with_const = add_constant(X)
+
+        model = OLS(y, X_with_const).fit()
+
+        # 初始化参数：β = [截距, 斜率]
+        self.beta = np.array([model.params[0], model.params[1]])
+
+        # 初始化协方差矩阵
+        self.P = np.eye(2) * self.initial_covariance
+
+        self.initialized = True
+        self.beta_history = [self.beta.copy()]
+        self.change_history = [0.0]
+
+        print(f"RLS初始化完成: 初始对冲比率 = {self.beta[1]:.6f}, 截距 = {self.beta[0]:.6f}")
+
+    def update(self, price1_t, price2_t):
+        """
+        更新对冲比率（RLS更新步骤）
+
+        Args:
+            price1_t: 当前时刻价格1
+            price2_t: 当前时刻价格2
+
+        Returns:
+            float: 更新后的对冲比率（斜率）
+        """
+        if not self.initialized:
+            raise ValueError("RLS未初始化，请先调用initialize()")
+
+        # 特征向量：x_t = [1, price2_t]
+        x_t = np.array([1.0, price2_t])
+        y_t = price1_t
+
+        # 预测误差
+        prediction = np.dot(x_t, self.beta)
+        error = y_t - prediction
+
+        # Kalman增益
+        denominator = self.lambda_forgetting + np.dot(x_t, np.dot(self.P, x_t))
+        if denominator <= 0:
+            # 数值问题，跳过更新
+            return self.beta[1]
+
+        K_t = np.dot(self.P, x_t) / denominator
+
+        # 更新参数
+        beta_new = self.beta + K_t * error
+
+        # 限制变化率（防止突变）
+        if len(self.beta_history) > 0:
+            beta_old = self.beta_history[-1]
+            change_rate = abs((beta_new[1] - beta_old[1]) / (beta_old[1] + 1e-8))
+
+            if change_rate > self.max_change_rate:
+                # 限制变化率
+                max_change = self.max_change_rate * abs(beta_old[1])
+                if beta_new[1] > beta_old[1]:
+                    beta_new[1] = beta_old[1] + max_change
+                else:
+                    beta_new[1] = beta_old[1] - max_change
+                # 保持截距更新
+                beta_new[0] = self.beta[0] + K_t[0] * error
+
+        # 更新协方差矩阵
+        self.P = (self.P - np.outer(K_t, np.dot(self.P, x_t))) / self.lambda_forgetting
+
+        # 更新状态
+        self.beta = beta_new
+        self.beta_history.append(self.beta.copy())
+
+        # 记录变化率
+        if len(self.beta_history) > 1:
+            change = abs((self.beta[1] - self.beta_history[-2][1]) / (self.beta_history[-2][1] + 1e-8))
+            self.change_history.append(change)
+        else:
+            self.change_history.append(0.0)
+
+        return self.beta[1]
+
+    def get_hedge_ratio(self):
+        """获取当前对冲比率（斜率）"""
+        if not self.initialized:
+            return None
+        return self.beta[1]
+
+    def get_stability_metric(self, window=50):
+        """
+        计算稳定性指标（对冲比率变化的标准差）
+
+        Args:
+            window: 计算窗口大小
+
+        Returns:
+            float: 稳定性指标（越小越稳定）
+        """
+        if len(self.beta_history) < window:
+            return None
+
+        recent_betas = [beta[1] for beta in self.beta_history[-window:]]
+        return np.std(recent_betas)
+
+    def get_change_rate(self, window=10):
+        """
+        计算最近的变化率
+
+        Args:
+            window: 计算窗口大小
+
+        Returns:
+            float: 平均变化率
+        """
+        if len(self.change_history) < window:
+            return None
+
+        recent_changes = self.change_history[-window:]
+        return np.mean(recent_changes)
+
+    def reset(self):
+        """重置RLS状态"""
+        self.beta = None
+        self.P = None
+        self.initialized = False
+        self.beta_history = []
+        self.change_history = []
+
+
+# ==================== 协整检验辅助函数 ====================
+
+def calculate_hedge_ratio(price1, price2):
+    """
+    计算对冲比率（使用OLS回归）
+
+    Args:
+        price1: 第一个币种的价格序列
+        price2: 第二个币种的价格序列
+
+    Returns:
+        float: 对冲比率
+    """
+    # 确保两个序列长度一致
+    min_length = min(len(price1), len(price2))
+    price1_aligned = price1.iloc[:min_length] if hasattr(price1, 'iloc') else price1[:min_length]
+    price2_aligned = price2.iloc[:min_length] if hasattr(price2, 'iloc') else price2[:min_length]
+
+    # 使用OLS回归计算对冲比率
+    X = price2_aligned.values.reshape(-1, 1)
+    y = price1_aligned.values
+
+    # 添加常数项
+    X_with_const = add_constant(X)
+
+    # 执行回归
+    model = OLS(y, X_with_const).fit()
+    hedge_ratio = model.params[1]  # 斜率系数
+
+    return hedge_ratio
+
+
+def advanced_adf_test(series, max_lags=None, verbose=True):
+    """
+    执行增强的ADF检验
+    Args:
+        series: 时间序列
+        max_lags: 最大滞后阶数
+        verbose: 是否打印详细信息
+
+    Returns:
+        dict: ADF检验结果
+    """
+    if verbose:
+        print("执行ADF检验...")
+
+    try:
+        # 执行ADF检验
+        adf_result = adfuller(series, maxlag=max_lags, autolag='AIC')
+
+        adf_statistic = adf_result[0]
+        p_value = adf_result[1]
+        critical_values = adf_result[4]
+        used_lag = adf_result[2]
+
+        if verbose:
+            print(f"ADF检验结果:")
+            print(f"  ADF统计量: {adf_statistic:.6f}")
+            print(f"  P值: {p_value:.6f}")
+            print(f"  使用的滞后阶数: {used_lag}")
+            print(f"  临界值:")
+            for level, value in critical_values.items():
+                print(f"    {level}: {value:.6f}")
+
+        # 判断是否平稳
+        is_stationary = p_value < 0.05
+
+        if verbose:
+            print(f"  是否平稳: {'是' if is_stationary else '否'}")
+
+        return {
+            'adf_statistic': adf_statistic,
+            'p_value': p_value,
+            'critical_values': critical_values,
+            'used_lag': used_lag,
+            'is_stationary': is_stationary
+        }
+
+    except Exception as e:
+        if verbose:
+            print(f"ADF检验失败: {str(e)}")
+        return None
+
+
+def determine_integration_order(series, max_order=2):
+    """
+    确定序列的积分阶数
+
+    Args:
+        series: 时间序列
+        max_order: 最大检查的积分阶数
+
+    Returns:
+        int: 积分阶数（0=I(0), 1=I(1), 2=I(2), None=无法确定）
+    """
+    # 检验原序列
+    adf_result = advanced_adf_test(series, verbose=False)
+    if adf_result and adf_result['is_stationary']:
+        return 0  # I(0)
+
+    # 检验一阶差分
+    if max_order >= 1:
+        diff1 = series.diff().dropna()
+        if len(diff1) < 50:
+            return None
+        adf_result = advanced_adf_test(diff1, verbose=False)
+        if adf_result and adf_result['is_stationary']:
+            return 1  # I(1)
+
+    # 检验二阶差分
+    if max_order >= 2:
+        diff2 = series.diff().diff().dropna()
+        if len(diff2) < 50:
+            return None
+        adf_result = advanced_adf_test(diff2, verbose=False)
+        if adf_result and adf_result['is_stationary']:
+            return 2  # I(2)
+
+    return None  # 无法确定
+
+
+def enhanced_cointegration_test(price1, price2, symbol1, symbol2, verbose=True, diff_order=0):
+    """
+    正确的协整检验（Engle-Granger方法）
+
+    Args:
+        price1: 第一个价格序列
+        price2: 第二个价格序列
+        symbol1: 第一个币种名称
+        symbol2: 第二个币种名称
+        verbose: 是否打印详细信息
+        diff_order: 价差类型，0=原始价差，1=一阶差分价差
+
+    Returns:
+        dict: 检验结果
+    """
+    if verbose:
+        print(f"\n开始协整检验: {symbol1}/{symbol2}")
+        print("=" * 60)
+
+    results = {
+        'pair_name': f"{symbol1}/{symbol2}",
+        'symbol1': symbol1,
+        'symbol2': symbol2,
+        'price1_order': None,
+        'price2_order': None,
+        'hedge_ratio': None,
+        'spread': None,
+        'spread_adf': None,
+        'cointegration_found': False,
+        'best_test': None,
+        'diff_order': diff_order
+    }
+
+    # 步骤1: 检验price1的积分阶数
+    if verbose:
+        print(f"\n--- 步骤1: 检验 {symbol1} 的积分阶数 ---")
+    price1_order = determine_integration_order(price1, max_order=2)
+    results['price1_order'] = price1_order
+
+    if price1_order is None:
+        if verbose:
+            print(f"{symbol1} 的积分阶数无法确定，跳过协整检验")
+        return results
+
+    if price1_order == 0:
+        if verbose:
+            print(f"{symbol1} 是 I(0)（平稳序列），不能进行协整检验")
+        return results
+
+    if verbose:
+        print(f"{symbol1} 是 I({price1_order})")
+
+    # 步骤2: 检验price2的积分阶数
+    if verbose:
+        print(f"\n--- 步骤2: 检验 {symbol2} 的积分阶数 ---")
+    price2_order = determine_integration_order(price2, max_order=2)
+    results['price2_order'] = price2_order
+
+    if price2_order is None:
+        if verbose:
+            print(f"{symbol2} 的积分阶数无法确定，跳过协整检验")
+        return results
+
+    if price2_order == 0:
+        if verbose:
+            print(f"{symbol2} 是 I(0)（平稳序列），不能进行协整检验")
+        return results
+
+    if verbose:
+        print(f"{symbol2} 是 I({price2_order})")
+
+    # 步骤3: 检查两个序列是否同阶单整
+    if price1_order != price2_order:
+        if verbose:
+            print(f"{symbol1} 是 I({price1_order})，{symbol2} 是 I({price2_order})，积分阶数不同，不能协整")
+        return results
+
+    # 步骤4: 只有当两个序列都是I(1)时，才进行协整检验
+    if price1_order != 1:
+        if verbose:
+            print(f"当前只支持I(1)序列的协整检验，{symbol1}和{symbol2}都是I({price1_order})，跳过")
+        return results
+
+    if verbose:
+        print(f"\n {symbol1} 和 {symbol2} 都是 I(1)，可以进行协整检验")
+
+    # 步骤5: 根据diff_order计算对冲比率和价差
+    min_length = min(len(price1), len(price2))
+    price1_aligned = price1.iloc[:min_length] if hasattr(price1, 'iloc') else price1[:min_length]
+    price2_aligned = price2.iloc[:min_length] if hasattr(price2, 'iloc') else price2[:min_length]
+
+    if diff_order == 0:
+        # 原始价差：使用原始价格计算对冲比率和价差
+        if verbose:
+            print(f"\n--- 步骤3: 计算最优对冲比率（OLS回归，原始价格） ---")
+        hedge_ratio = calculate_hedge_ratio(price1_aligned, price2_aligned)
+        results['hedge_ratio'] = hedge_ratio
+
+        if verbose:
+            print(f"\n--- 步骤4: 计算原始价差（残差） ---")
+        spread = price1_aligned - hedge_ratio * price2_aligned
+        results['spread'] = spread
+
+        # 步骤6: 检验原始价差的平稳性（协整检验）
+        if verbose:
+            print(f"\n--- 步骤5: 检验原始价差的平稳性（协整检验） ---")
+    else:
+        # 一阶差分价差：使用一阶差分价格计算对冲比率和价差
+        if verbose:
+            print(f"\n--- 步骤3: 计算一阶差分价格 ---")
+        diff_price1 = price1_aligned.diff().dropna()
+        diff_price2 = price2_aligned.diff().dropna()
+
+        # 确保两个差分序列长度一致
+        min_diff_length = min(len(diff_price1), len(diff_price2))
+        diff_price1_aligned = diff_price1.iloc[:min_diff_length]
+        diff_price2_aligned = diff_price2.iloc[:min_diff_length]
+
+        if verbose:
+            print(f"\n--- 步骤4: 计算最优对冲比率（OLS回归，一阶差分价格） ---")
+        hedge_ratio = calculate_hedge_ratio(diff_price1_aligned, diff_price2_aligned)
+        results['hedge_ratio'] = hedge_ratio
+
+        if verbose:
+            print(f"\n--- 步骤5: 计算一阶差分价差 ---")
+        spread = diff_price1_aligned - hedge_ratio * diff_price2_aligned
+        results['spread'] = spread
+
+        # 步骤6: 检验一阶差分价差的平稳性（协整检验）
+        if verbose:
+            print(f"\n--- 步骤6: 检验一阶差分价差的平稳性（协整检验） ---")
+
+    spread_adf = advanced_adf_test(spread, verbose=verbose)
+    results['spread_adf'] = spread_adf
+
+    if spread_adf and spread_adf['is_stationary']:
+        # 价差平稳，协整关系成立！
+        results['cointegration_found'] = True
+        results['best_test'] = {
+            'type': 'cointegration',
+            'adf_result': spread_adf,
+            'spread': spread
+        }
+        if verbose:
+            print(f"\n 协整检验通过！{symbol1} 和 {symbol2} 存在协整关系")
+            print(f"  价差是平稳的（I(0)），ADF P值: {spread_adf['p_value']:.6f}")
+    else:
+        if verbose:
+            print(f"\n 协整检验未通过")
+            print(f"  价差不平稳，ADF P值: {spread_adf['p_value']:.6f if spread_adf else 'N/A'}")
+
+    return results
+
+
+# ==================== 高级交易流程代码 ====================
+
+class AdvancedCointegrationTrading:
+    """高级协整交易策略类（支持策略模式）"""
+
+    def __init__(self, binance_api, lookback_period=60, z_threshold=2.0, z_exit_threshold=0.5,
+                 take_profit_pct=0.15, stop_loss_pct=0.08, max_holding_hours=168,
+                 position_ratio=0.5, leverage=5, trading_fee_rate=0.0005,
+                 z_score_strategy=None, use_arima_garch=False, arima_order=(1, 0, 1), garch_order=(1, 1),
+                 use_periodic_recalc=True, use_rls=False, rls_lambda=0.99,
+                 hedge_ratio_max_change_rate=0.2, rls_max_change_rate=None,
+                 cointegration_window_size=500, cointegration_check_interval=240, diff_order=0,
+                 expiry_no_entry_days=7, expiry_force_close_days=3, settlement_asset=None):
+        """
+        初始化高级协整交易策略（支持定期协整重算或RLS动态对冲比率）
+
+        Args:
+            binance_api: 币安API客户端
+            lookback_period: 回看期
+            z_threshold: Z-score开仓阈值
+            z_exit_threshold: Z-score平仓阈值
+            take_profit_pct: 止盈百分比
+            stop_loss_pct: 止损百分比
+            max_holding_hours: 最大持仓时间（小时）
+            position_ratio: 仓位比例（默认0.5，即使用50%资金，留50%作为安全垫）
+            leverage: 杠杆倍数
+            trading_fee_rate: 交易手续费率（币本位 taker 默认 0.05%）
+            expiry_no_entry_days: 近月交割日前禁开仓天数
+            expiry_force_close_days: 近月交割日前强制平仓天数
+            settlement_asset: 结算币，如 SOL / BTC
+            z_score_strategy: Z-score计算策略对象（BaseZScoreStrategy实例）
+            use_arima_garch: 是否使用ARIMA-GARCH模型（向后兼容，如果提供了z_score_strategy则忽略此参数）
+            arima_order: ARIMA模型阶数 (p, d, q)（向后兼容）
+            garch_order: GARCH模型阶数 (p, q)（向后兼容）
+            use_periodic_recalc: 是否使用定期协整重算更新对冲比率（推荐，默认开启）
+            use_rls: 是否使用RLS递推更新对冲比率（实验性，与定期重算二选一）
+            rls_lambda: RLS遗忘因子（0 < λ ≤ 1）
+            hedge_ratio_max_change_rate: 对冲比率单次最大变化率（定期重算与RLS共用）
+            rls_max_change_rate: 已废弃，请使用 hedge_ratio_max_change_rate
+            cointegration_window_size: 协整检验/OLS 滚动窗口大小（默认500）
+            cointegration_check_interval: 协整重算间隔（K线根数，默认240）
+            diff_order: 价差类型，0=原始价差，1=一阶差分价差
+        """
+        self.binance_api = binance_api
+        self.lookback_period = lookback_period
+        self.z_threshold = z_threshold
+        self.z_exit_threshold = z_exit_threshold
+        self.take_profit_pct = take_profit_pct
+        self.stop_loss_pct = stop_loss_pct
+        self.max_holding_hours = max_holding_hours
+        self.position_ratio = position_ratio
+        self.leverage = leverage
+        self.trading_fee_rate = trading_fee_rate
+        self.expiry_no_entry_days = max(0, int(expiry_no_entry_days))
+        self.expiry_force_close_days = max(0, int(expiry_force_close_days))
+        self.settlement_asset = (settlement_asset or 'COIN').upper()
+        self.last_prices = {}
+        self.positions = {}  # 当前持仓
+        self.trades = []  # 交易记录
+        self.capital_curve = []  # 资金曲线
+        self.running = False
+        # 单边平仓失败时的待恢复列表：{pair_name: {'symbol': 待平仓的symbol, 'side': 'BUY'/'SELL', 'quantity': 数量}}
+        self.pending_recovery_close = {}
+
+        # 对冲比率更新模式（定期重算与 RLS 互斥）
+        self.use_periodic_recalc = use_periodic_recalc and not use_rls
+        self.use_rls = use_rls and not self.use_periodic_recalc
+        self.rls_lambda = rls_lambda
+        if rls_max_change_rate is not None:
+            hedge_ratio_max_change_rate = rls_max_change_rate
+        self.hedge_ratio_max_change_rate = hedge_ratio_max_change_rate
+        self.rls_max_change_rate = self.hedge_ratio_max_change_rate  # 向后兼容
+
+        # RLS实例字典（每个币对一个RLS实例）
+        self.rls_instances = {}
+
+        # 定期重算模式下的当前对冲比率
+        self.hedge_ratios = {}  # {pair_key: float}
+
+        # 协整状态跟踪（每个币对的协整状态）
+        self.cointegration_status = {}  # {pair_key: {'is_cointegrated': bool, 'last_check_index': int, 'cointegration_ratio': float}}
+
+        # 协整检验相关参数
+        self.cointegration_window_size = cointegration_window_size
+        self.cointegration_check_interval = cointegration_check_interval
+        self.diff_order = diff_order
+
+        # 协整检验计数器（用于实盘交易，记录数据点数量）
+        self.data_point_count = {}  # {pair_key: count}
+
+        # 存储历史价格数据（用于RLS和策略）
+        self.price_history = {}  # {pair_key: {'price1': [...], 'price2': [...]}}
+
+        # 设置Z-score策略
+        if z_score_strategy is not None:
+            self.z_score_strategy = z_score_strategy
+            self.use_arima_garch = isinstance(z_score_strategy,
+                                              ArimaGarchZScoreStrategy) if STRATEGIES_AVAILABLE else False
+            self.use_ecm = isinstance(z_score_strategy, EcmZScoreStrategy) if STRATEGIES_AVAILABLE else False
+            self.use_kalman_filter = isinstance(z_score_strategy,
+                                                KalmanFilterZScoreStrategy) if STRATEGIES_AVAILABLE else False
+            self.use_copula_dcc_garch = isinstance(z_score_strategy,
+                                                   CopulaDccGarchZScoreStrategy) if STRATEGIES_AVAILABLE else False
+            self.use_regime_switching = isinstance(z_score_strategy,
+                                                   RegimeSwitchingZScoreStrategy) if STRATEGIES_AVAILABLE else False
+        elif use_arima_garch and STRATEGIES_AVAILABLE and ARIMA_AVAILABLE and GARCH_AVAILABLE:
+            try:
+                self.z_score_strategy = ArimaGarchZScoreStrategy(arima_order=arima_order, garch_order=garch_order)
+                self.use_arima_garch = True
+                self.use_ecm = False
+                self.use_kalman_filter = False
+                self.use_copula_dcc_garch = False
+                self.use_regime_switching = False
+            except Exception as e:
+                print(f"警告: ARIMA-GARCH策略初始化失败: {str(e)}，使用传统策略")
+                self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+                self.use_arima_garch = False
+                self.use_ecm = False
+                self.use_kalman_filter = False
+                self.use_copula_dcc_garch = False
+                self.use_regime_switching = False
+        else:
+            self.z_score_strategy = TraditionalZScoreStrategy() if STRATEGIES_AVAILABLE else None
+            self.use_arima_garch = False
+            self.use_ecm = False
+            self.use_kalman_filter = False
+            self.use_copula_dcc_garch = False
+            self.use_regime_switching = False
+
+        # 向后兼容：保留旧属性
+        self.arima_order = arima_order
+        self.garch_order = garch_order
+
+        # 初始化账户信息
+        self._initialize_account()
+
+    def _initialize_account(self):
+        """初始化账户信息（结算币钱包，不是 USDT）"""
+        try:
+            print("正在获取币本位账户信息...")
+            account_info = self.binance_api.get_account_info()
+
+            if account_info:
+                asset = self.settlement_asset if self.settlement_asset != 'COIN' else None
+                if not asset:
+                    for item in account_info.get('assets') or []:
+                        try:
+                            if float(item.get('walletBalance') or 0) > 0:
+                                asset = item.get('asset')
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                if asset:
+                    self.settlement_asset = str(asset).upper()
+                self.initial_capital = dapi_wallet_balance(account_info, self.settlement_asset)
+                self.current_capital = dapi_asset_balance(account_info, self.settlement_asset)
+                print(" 账户初始化成功")
+                print(f"  结算币: {self.settlement_asset}")
+                print(f"  钱包余额: {self.initial_capital:.8f} {self.settlement_asset}")
+                print(f"  可用保证金: {self.current_capital:.8f} {self.settlement_asset}")
+            else:
+                print("✗ 无法获取账户信息，使用默认值")
+                self.initial_capital = 0.0
+                self.current_capital = 0.0
+        except Exception as e:
+            print(f"账户初始化失败: {str(e)}")
+            self.initial_capital = 0.0
+            self.current_capital = 0.0
+
+    def remember_prices(self, prices: dict):
+        if not prices:
+            return
+        for symbol, px in prices.items():
+            if px is not None:
+                try:
+                    self.last_prices[symbol] = float(px)
+                except (TypeError, ValueError):
+                    continue
+
+    def _pair_close_prices(self, symbol1, symbol2, current_prices):
+        prices = {}
+        for symbol in (symbol1, symbol2):
+            if current_prices and symbol in current_prices and current_prices[symbol] is not None:
+                prices[symbol] = float(current_prices[symbol])
+            elif symbol in self.last_prices:
+                prices[symbol] = float(self.last_prices[symbol])
+        return prices
+
+    def expiry_days_left(self, pair_info, now=None):
+        now = now if now is not None else datetime.now()
+        expiry = pair_near_expiry_date(pair_info['symbol1'], pair_info['symbol2'])
+        return calendar_days_to_expiry(now, expiry), expiry
+
+    def should_force_expiry_close(self, pair_info, now=None):
+        days, _ = self.expiry_days_left(pair_info, now)
+        return days is not None and days <= self.expiry_force_close_days
+
+    def should_block_entry(self, pair_info, now=None):
+        days, _ = self.expiry_days_left(pair_info, now)
+        if days is None:
+            return False
+        return days <= self.expiry_no_entry_days or days <= self.expiry_force_close_days
+
+    def try_expiry_or_missing_flatten(self, pair_info, live_prices, timestamp):
+        """
+        有仓时：近月进入强制平仓窗口，或本轮两腿没有完整行情，则强制平仓。
+        返回 True 表示本轮不要再对该对做开仓/Z 决策。
+        """
+        pair_name = pair_info['pair_name']
+        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+        has_pos = pair_name in self.positions
+        has_both = bool(live_prices) and symbol1 in live_prices and symbol2 in live_prices
+        now = timestamp if timestamp is not None else datetime.now()
+        days, expiry = self.expiry_days_left(pair_info, now)
+        in_force = days is not None and days <= self.expiry_force_close_days
+
+        if has_pos and (in_force or not has_both):
+            close_prices = self._pair_close_prices(symbol1, symbol2, live_prices or {})
+            if in_force:
+                if days is not None and days < 0:
+                    reason = f"近月已交割，强制平仓(到期日{expiry})"
+                else:
+                    reason = f"近月交割前强制平仓(到期日{expiry}，剩余{days}天)"
+            else:
+                reason = "两腿行情不再重叠，强制平仓"
+            print(f"  [交割/缺腿] {pair_name}: {reason}")
+            self.close_position(pair_info, close_prices, reason, now, 0.0)
+            return True
+
+        if not has_both:
+            return True
+        if self.should_block_entry(pair_info, now) and not has_pos:
+            return False
+        return False
+
+    def calculate_current_spread(self, price1, price2, hedge_ratio):
+        """计算当前价差（原序列）"""
+        return price1 - hedge_ratio * price2
+
+    def calculate_position_size_beta_neutral(self, margin_coin, price1, price2, hedge_ratio, signal,
+                                             contract_size1, contract_size2):
+        """
+        币本位：按结算币保证金预算，输出整数张数（正多负空）。
+        """
+        if margin_coin <= 0 or price1 <= 0 or price2 <= 0:
+            return None, None, 0
+        if contract_size1 <= 0 or contract_size2 <= 0 or self.leverage <= 0:
+            return None, None, 0
+
+        beta = abs(float(hedge_ratio))
+        q1 = margin_coin * self.leverage / (1.0 + beta)
+        n1 = int(np.floor(q1 * price1 / contract_size1))
+        n2 = int(round(beta * q1 * price2 / contract_size2))
+        n1 = max(n1, 0)
+        n2 = max(n2, 0)
+        if n1 < 1 or n2 < 1:
+            return None, None, 0
+
+        def _im(n, cs, px):
+            return inverse_margin_coin(n, cs, px, self.leverage)
+
+        margin_used = _im(n1, contract_size1, price1) + _im(n2, contract_size2, price2)
+        hedge_n2_per_n1 = beta * price2 * contract_size1 / (price1 * contract_size2)
+        while n1 >= 1 and n2 >= 1 and margin_used > margin_coin * 1.0000001:
+            n1 -= 1
+            n2 = max(1, int(round(n1 * hedge_n2_per_n1)))
+            margin_used = _im(n1, contract_size1, price1) + _im(n2, contract_size2, price2)
+        if n1 < 1 or n2 < 1:
+            return None, None, 0
+
+        if signal['action'] == 'SHORT_LONG':
+            s1, s2 = -n1, n2
+        elif signal['action'] == 'LONG_SHORT':
+            s1, s2 = n1, -n2
+        else:
+            return None, None, 0
+        return s1, s2, margin_used
+
+    def initialize_rls_for_pair(self, pair_key, initial_price1, initial_price2):
+        """
+        为币对初始化RLS
+
+        Args:
+            pair_key: 币对键
+            initial_price1: 初始价格序列1
+            initial_price2: 初始价格序列2
+        """
+        if not self.use_rls:
+            return
+
+        try:
+            rls = RecursiveLeastSquares(
+                lambda_forgetting=self.rls_lambda,
+                max_change_rate=self.hedge_ratio_max_change_rate
+            )
+            rls.initialize(initial_price1, initial_price2)
+            self.rls_instances[pair_key] = rls
+
+            # 初始化协整状态
+            self.cointegration_status[pair_key] = {
+                'is_cointegrated': True,
+                'last_check_index': 0,
+                'cointegration_ratio': 1.0,  # 初始假设协整
+                'last_hedge_ratio': rls.get_hedge_ratio(),
+                'consecutive_failures': 0  # 连续失败计数
+            }
+
+            # 初始化数据点计数器
+            self.data_point_count[pair_key] = 0
+
+            # 初始化价格历史
+            self.price_history[pair_key] = {
+                'price1': list(initial_price1) if hasattr(initial_price1, '__iter__') and not isinstance(initial_price1,
+                                                                                                         str) else [
+                    initial_price1],
+                'price2': list(initial_price2) if hasattr(initial_price2, '__iter__') and not isinstance(initial_price2,
+                                                                                                         str) else [
+                    initial_price2]
+            }
+
+            print(f"✓ {pair_key} RLS初始化完成，对冲比率: {rls.get_hedge_ratio():.6f}")
+        except Exception as e:
+            print(f"警告: 为币对 {pair_key} 初始化RLS失败: {str(e)}")
+
+    def update_rls_for_pair(self, pair_key, price1_t, price2_t):
+        """
+        更新币对的RLS对冲比率
+
+        Args:
+            pair_key: 币对键
+            price1_t: 当前价格1
+            price2_t: 当前价格2
+
+        Returns:
+            float: 更新后的对冲比率，如果失败返回None
+        """
+        if not self.use_rls or pair_key not in self.rls_instances:
+            return None
+
+        try:
+            rls = self.rls_instances[pair_key]
+            hedge_ratio = rls.update(price1_t, price2_t)
+
+            # 更新价格历史
+            if pair_key in self.price_history:
+                self.price_history[pair_key]['price1'].append(price1_t)
+                self.price_history[pair_key]['price2'].append(price2_t)
+                # 保持历史长度不超过lookback_period
+                if len(self.price_history[pair_key]['price1']) > self.lookback_period * 2:
+                    self.price_history[pair_key]['price1'] = self.price_history[pair_key]['price1'][
+                                                             -self.lookback_period:]
+                    self.price_history[pair_key]['price2'] = self.price_history[pair_key]['price2'][
+                                                             -self.lookback_period:]
+
+            return hedge_ratio
+        except Exception as e:
+            print(f"警告: 更新币对 {pair_key} 的RLS失败: {str(e)}")
+            return None
+
+    def _apply_hedge_ratio_with_limit(self, pair_key, new_ratio):
+        """应用对冲比率更新，并限制单次变化幅度"""
+        if new_ratio is None or not np.isfinite(new_ratio):
+            return self.get_hedge_ratio_for_pair(pair_key, {})
+
+        old_ratio = self.hedge_ratios.get(pair_key, new_ratio)
+        if abs(old_ratio) > 1e-8:
+            change_rate = abs((new_ratio - old_ratio) / old_ratio)
+            if change_rate > self.hedge_ratio_max_change_rate:
+                max_change = self.hedge_ratio_max_change_rate * abs(old_ratio)
+                if new_ratio > old_ratio:
+                    new_ratio = old_ratio + max_change
+                else:
+                    new_ratio = old_ratio - max_change
+
+        self.hedge_ratios[pair_key] = new_ratio
+        if pair_key in self.cointegration_status:
+            self.cointegration_status[pair_key]['last_hedge_ratio'] = new_ratio
+        return new_ratio
+
+    def get_hedge_ratio_for_pair(self, pair_key, pair_info):
+        """获取币对当前对冲比率（定期重算 / RLS / 静态）"""
+        if self.use_rls and pair_key in self.rls_instances:
+            hr = self.rls_instances[pair_key].get_hedge_ratio()
+            if hr is not None:
+                return hr
+        if pair_key in self.hedge_ratios:
+            return self.hedge_ratios[pair_key]
+        return pair_info.get('hedge_ratio', 1.0)
+
+    def initialize_periodic_hedge_for_pair(self, pair_key, price1, price2, symbol1, symbol2, pair_info):
+        """
+        定期重算模式：用预热窗口做协整检验 + OLS，初始化对冲比率
+        """
+        if not self.use_periodic_recalc:
+            return
+
+        min_length = min(len(price1), len(price2))
+        if min_length < 30:
+            raise ValueError(f"{pair_key} 预热数据不足（需要至少30个数据点）")
+
+        window_size = min(min_length, self.cointegration_window_size)
+        price1_aligned = price1.iloc[-window_size:] if hasattr(price1, 'iloc') else price1[-window_size:]
+        price2_aligned = price2.iloc[-window_size:] if hasattr(price2, 'iloc') else price2[-window_size:]
+
+        coint_result = enhanced_cointegration_test(
+            price1_aligned, price2_aligned, symbol1, symbol2,
+            verbose=False, diff_order=self.diff_order
+        )
+
+        is_cointegrated = coint_result.get('cointegration_found', False)
+        hedge_ratio = coint_result.get('hedge_ratio')
+        if hedge_ratio is None:
+            hedge_ratio = pair_info.get('hedge_ratio', 1.0)
+
+        self.hedge_ratios[pair_key] = hedge_ratio
+        pair_info['hedge_ratio'] = hedge_ratio
+
+        self.cointegration_status[pair_key] = {
+            'is_cointegrated': is_cointegrated,
+            'last_check_index': 0,
+            'cointegration_ratio': 1.0 if is_cointegrated else 0.0,
+            'last_hedge_ratio': hedge_ratio,
+            'consecutive_failures': 0
+        }
+        self.data_point_count[pair_key] = 0
+
+        spread_adf = coint_result.get('spread_adf', {})
+        p_value = spread_adf.get('p_value', 1.0) if spread_adf else 1.0
+        status_text = '通过' if is_cointegrated else '未通过'
+        print(f" {pair_key} 定期重算初始化: 对冲比率={hedge_ratio:.6f}, 协整检验{status_text}, ADF P={p_value:.6f}")
+
+    def check_cointegration_periodically(self, pair_key, price1_series, price2_series, symbol1, symbol2):
+        """
+        定期进行协整检验（实盘交易版本）
+
+        Args:
+            pair_key: 币对标识
+            price1_series: 价格序列1（pandas Series或list）
+            price2_series: 价格序列2（pandas Series或list）
+            symbol1: 币种1名称
+            symbol2: 币种2名称
+
+        Returns:
+            dict: 协整检验结果
+        """
+        if pair_key not in self.cointegration_status:
+            return {'is_cointegrated': False, 'cointegration_ratio': 0.0}
+
+        status = self.cointegration_status[pair_key]
+        last_check = status['last_check_index']
+        current_index = self.data_point_count.get(pair_key, 0)
+
+        # 定期重算与 RLS 模式均支持协整监控；静态模式直接跳过
+        if not self.use_periodic_recalc and not self.use_rls:
+            return {
+                'is_cointegrated': True,
+                'cointegration_ratio': 1.0
+            }
+
+        # 检查是否需要重新检验（每N个数据点检验一次）
+        if current_index - last_check < self.cointegration_check_interval:
+            # 不需要检验，返回当前状态
+            return {
+                'is_cointegrated': status['is_cointegrated'],
+                'cointegration_ratio': status.get('cointegration_ratio', 1.0)
+            }
+
+        # 需要重新检验
+        print(f"\n{'=' * 60}")
+        print(f"定期协整检验: {symbol1}/{symbol2} (数据点: {current_index})")
+        print(f"{'=' * 60}")
+
+        # 转换为pandas Series（如果还不是）
+        if not isinstance(price1_series, pd.Series):
+            price1_series = pd.Series(price1_series)
+        if not isinstance(price2_series, pd.Series):
+            price2_series = pd.Series(price2_series)
+
+        # 使用与初始筛选相同的窗口大小进行协整检验
+        # 如果可用数据不足，使用可用数据的80%，但至少需要100个数据点
+        max_window_size = min(len(price1_series), len(price2_series))
+        target_window_size = self.cointegration_window_size
+
+        # 如果可用数据少于目标窗口大小，使用可用数据的80%
+        if max_window_size < target_window_size:
+            window_size = max(100, int(max_window_size * 0.8))  # 至少100个数据点
+            print(f"  可用数据不足，使用可用数据的80%: {window_size} 个数据点（目标: {target_window_size}）")
+        else:
+            window_size = target_window_size
+            print(f"  使用窗口大小: {window_size} 个数据点（与初始筛选一致）")
+
+        if window_size < 100:  # 至少需要100个数据点
+            print(f"  数据不足，跳过协整检验（需要至少100个数据点，当前{window_size}个）")
+            # 如果数据不足，保持当前状态，但标记为需要更多数据
+            return {
+                'is_cointegrated': status['is_cointegrated'],
+                'cointegration_ratio': status.get('cointegration_ratio', 1.0)
+            }
+
+        # 获取最近的数据
+        recent_price1 = price1_series.iloc[-window_size:] if hasattr(price1_series, 'iloc') else price1_series[
+                                                                                                 -window_size:]
+        recent_price2 = price2_series.iloc[-window_size:] if hasattr(price2_series, 'iloc') else price2_series[
+                                                                                                 -window_size:]
+
+        # 执行协整检验
+        try:
+            coint_result = enhanced_cointegration_test(
+                recent_price1, recent_price2, symbol1, symbol2,
+                verbose=False, diff_order=self.diff_order
+            )
+
+            is_cointegrated = coint_result.get('cointegration_found', False)
+            spread_adf = coint_result.get('spread_adf', {})
+            p_value = spread_adf.get('p_value', 1.0) if spread_adf else 1.0
+            new_hedge_ratio = coint_result.get('hedge_ratio')
+            was_cointegrated = status.get('is_cointegrated', True)
+
+            print(f"  协整检验结果: {'通过' if is_cointegrated else '失败'}")
+            print(f"  ADF P值: {p_value:.6f}")
+
+            # 更新协整状态
+            status['is_cointegrated'] = is_cointegrated
+            status['last_check_index'] = current_index
+
+            if is_cointegrated:
+                print(f"   协整检验通过: {symbol1}/{symbol2} 仍然协整")
+                if not was_cointegrated:
+                    print(f"   协整关系已恢复！")
+                status['cointegration_ratio'] = 1.0
+                status['consecutive_failures'] = 0
+
+                # 定期重算模式：检验通过时同步更新对冲比率
+                if self.use_periodic_recalc and new_hedge_ratio is not None:
+                    old_hr = self.hedge_ratios.get(pair_key, new_hedge_ratio)
+                    applied_hr = self._apply_hedge_ratio_with_limit(pair_key, new_hedge_ratio)
+                    print(f"  对冲比率更新: {old_hr:.6f} -> {applied_hr:.6f} (OLS窗口={window_size})")
+            else:
+                # 增加连续失败计数
+                consecutive_failures = status.get('consecutive_failures', 0) + 1
+                status['consecutive_failures'] = consecutive_failures
+
+                print(f"  协整检验失败: {symbol1}/{symbol2} 协整关系破裂！")
+                print(f"  连续失败次数: {consecutive_failures}")
+                print(f"    将在 {self.cointegration_check_interval} 个数据点后重新检验")
+                status['cointegration_ratio'] = 0.0
+                print(f"    禁止开新仓；若仍有持仓将强制平仓")
+
+            return {
+                'is_cointegrated': is_cointegrated,
+                'cointegration_ratio': status.get('cointegration_ratio', 0.0),
+                'coint_result': coint_result
+            }
+
+        except Exception as e:
+            print(f"  协整检验出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 检验出错时，保持当前状态，不改变协整状态
+            return {
+                'is_cointegrated': status['is_cointegrated'],
+                'cointegration_ratio': status.get('cointegration_ratio', 1.0)
+            }
+
+    def is_cointegration_trading_allowed(self, pair_key):
+        """定期协整/RLS 模式下，协整未通过则禁止开新仓。"""
+        if not self.use_periodic_recalc and not self.use_rls:
+            return True
+        if pair_key not in self.cointegration_status:
+            return True
+        return self.cointegration_status[pair_key].get('is_cointegrated', False)
+
+    def force_close_on_cointegration_failure(self, pair_info, current_prices, timestamp, current_hedge_ratio):
+        """协整检验失败时强制平仓。"""
+        pair_name = pair_info['pair_name']
+        if pair_name not in self.positions:
+            return None
+
+        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+        current_spread = self.calculate_current_spread(
+            current_prices[symbol1], current_prices[symbol2], current_hedge_ratio
+        )
+        reason = "协整检验失败，强制平仓"
+        print(f"  {pair_name}: {reason}")
+        return self.close_position(pair_info, current_prices, reason, timestamp, current_spread)
+
+    def calculate_z_score(self, current_spread, historical_spreads, historical_prices1=None, historical_prices2=None):
+        """
+        计算当前Z-score（使用策略对象）
+
+        Args:
+            current_spread: 当前价差
+            historical_spreads: 历史价差序列
+            historical_prices1: 历史价格序列1（可选，某些策略需要）
+            historical_prices2: 历史价格序列2（可选，某些策略需要）
+
+        Returns:
+            float: Z-score值
+        """
+        # 如果使用了策略对象，调用策略的方法
+        if self.z_score_strategy is not None:
+            return self.z_score_strategy.calculate_z_score(
+                current_spread,
+                historical_spreads,
+                historical_prices1=historical_prices1,
+                historical_prices2=historical_prices2
+            )
+
+        # 向后兼容：如果没有策略对象，使用传统方法
+        if len(historical_spreads) < 2:
+            return 0.0
+
+        spread_mean = np.mean(historical_spreads)
+        spread_std = np.std(historical_spreads)
+
+        if spread_std == 0:
+            return 0.0
+
+        return (current_spread - spread_mean) / spread_std
+
+    def generate_trading_signal(self, z_score):
+        """生成交易信号"""
+        if z_score > self.z_threshold:
+            return {
+                'action': 'SHORT_LONG',
+                'description': f'Z-score过高({z_score:.3f})，做空价差',
+                'confidence': min(abs(z_score) / 3.0, 1.0)
+            }
+        elif z_score < -self.z_threshold:
+            return {
+                'action': 'LONG_SHORT',
+                'description': f'Z-score过低({z_score:.3f})，做多价差',
+                'confidence': min(abs(z_score) / 3.0, 1.0)
+            }
+        else:
+            return {
+                'action': 'HOLD',
+                'description': f'Z-score正常({z_score:.3f})，观望',
+                'confidence': 0.0
+            }
+
+    def execute_trade(self, pair_info, current_prices, signal, timestamp, current_spread, available_capital):
+        """
+        执行交易（实盘下单）
+
+        Args:
+            pair_info: 币对信息
+            current_prices: 当前价格字典
+            signal: 交易信号
+            timestamp: 时间戳
+            current_spread: 当前价差
+            available_capital: 可用资金
+        """
+        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+        hedge_ratio = pair_info['hedge_ratio']
+        price1, price2 = current_prices[symbol1], current_prices[symbol2]
+        base1, base2 = parse_coin_m_base(symbol1), parse_coin_m_base(symbol2)
+        if base1 != base2:
+            print(f"开仓失败: 两腿结算币不同 {base1}/{base2}")
+            return None
+        self.settlement_asset = base1
+        cs1 = coin_m_contract_size(symbol1)
+        cs2 = coin_m_contract_size(symbol2)
+
+        symbol1_size, symbol2_size, total_capital_used = self.calculate_position_size_beta_neutral(
+            available_capital, price1, price2, hedge_ratio, signal, cs1, cs2
+        )
+
+        if symbol1_size is None:
+            print(
+                f"开仓失败: 保证金不足或不足 1 张 "
+                f"(可用保证金: {available_capital:.8f} {self.settlement_asset})"
+            )
+            return None
+
+        # 张数已是整数；再按交易所 stepSize 对齐
+        step_size1 = self.binance_api.get_symbol_precision(symbol1)
+        step_size2 = self.binance_api.get_symbol_precision(symbol2)
+
+        # 根据stepSize确定小数位数
+        def get_decimal_places(step_size):
+            if step_size >= 1:
+                return 0
+            elif step_size >= 0.1:
+                return 1
+            elif step_size >= 0.01:
+                return 2
+            elif step_size >= 0.001:
+                return 3
+            else:
+                return 4
+
+        # 使用Decimal避免浮点数精度问题
+        quantity1_raw = Decimal(str(abs(symbol1_size)))
+        quantity2_raw = Decimal(str(abs(symbol2_size)))
+        step_size1_decimal = Decimal(str(step_size1))
+        step_size2_decimal = Decimal(str(step_size2))
+
+        # 计算到stepSize的倍数
+        quantity1_multiple = (quantity1_raw / step_size1_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+        quantity2_multiple = (quantity2_raw / step_size2_decimal).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+        # 转换为最终数量
+        quantity1 = int(round(float(quantity1_multiple * step_size1_decimal)))
+        quantity2 = int(round(float(quantity2_multiple * step_size2_decimal)))
+        if quantity1 < 1 or quantity2 < 1:
+            print(f"开仓失败: 对齐后张数不足 1 张 ({quantity1}/{quantity2})")
+            return None
+
+        # 初始化订单变量
+        order1 = None
+        order2 = None
+
+        if signal['action'] == 'SHORT_LONG':
+            # 做空价差：做空symbol1，做多symbol2
+            print(f"  下单计划: {symbol1} SELL {quantity1}, {symbol2} BUY {quantity2}")
+            order1 = self.binance_api.place_order(symbol1, 'SELL', quantity1)
+            order2 = self.binance_api.place_order(symbol2, 'BUY', quantity2)
+
+        elif signal['action'] == 'LONG_SHORT':
+            # 做多价差：做多symbol1，做空symbol2
+            print(f"  下单计划: {symbol1} BUY {quantity1}, {symbol2} SELL {quantity2}")
+            order1 = self.binance_api.place_order(symbol1, 'BUY', quantity1)
+            order2 = self.binance_api.place_order(symbol2, 'SELL', quantity2)
+
+        # 检查下单结果
+        if order1 and order2 and order1.get('orderId') and order2.get('orderId'):
+            # 等待订单成交
+            success, final_status1, final_status2 = self.wait_for_orders_completion(
+                order1, order2, symbol1, symbol2
+            )
+
+            if success:
+                # 创建持仓记录
+                position = {
+                    'pair': f"{symbol1}_{symbol2}",
+                    'symbol1': symbol1,
+                    'symbol2': symbol2,
+                    'symbol1_size': -quantity1 if signal['action'] == 'SHORT_LONG' else quantity1,
+                    'symbol2_size': quantity2 if signal['action'] == 'SHORT_LONG' else -quantity2,
+                    'entry_prices': {symbol1: price1, symbol2: price2},
+                    'entry_spread': current_spread,
+                    'hedge_ratio': hedge_ratio,
+                    'entry_time': timestamp,
+                    'signal': signal,
+                    'capital_used': total_capital_used,
+                    'contract_size1': cs1,
+                    'contract_size2': cs2,
+                    'settlement_asset': base1,
+                    'notional_coin': (
+                        abs(quantity1) * cs1 / price1 + abs(quantity2) * cs2 / price2
+                    ),
+                    'orders': [order1, order2]
+                }
+
+                self.positions[pair_info['pair_name']] = position
+
+                # 记录开仓交易
+                trade = {
+                    'timestamp': timestamp,
+                    'pair': pair_info['pair_name'],
+                    'action': 'OPEN',
+                    'symbol1': symbol1,
+                    'symbol2': symbol2,
+                    'symbol1_size': position['symbol1_size'],
+                    'symbol2_size': position['symbol2_size'],
+                    'symbol1_price': price1,
+                    'symbol2_price': price2,
+                    'hedge_ratio': hedge_ratio,
+                    'signal': signal,
+                    'z_score': signal.get('z_score', 0),
+                    'entry_spread': current_spread,
+                    'capital_used': total_capital_used
+                }
+                self.trades.append(trade)
+
+                print(f"实盘开仓: {pair_info['pair_name']}")
+                print(f"   信号: {signal['description']}")
+                print(f"   价格: {symbol1}={price1:.2f}, {symbol2}={price2:.2f}")
+                print(f"   价差: {current_spread:.6f}")
+                print(f"   张数: {symbol1}={position['symbol1_size']} 张, {symbol2}={position['symbol2_size']} 张")
+                print(f"   初始保证金: {total_capital_used:.8f} {base1}")
+
+                return position
+            else:
+                print(f"订单未完全成交，不保存持仓")
+                return None
+        elif order1 and order1.get('orderId') and (not order2 or not order2.get('orderId')):
+            # 第一个订单成功，第二个订单失败
+            print(f"配对交易失败: {symbol1} 成功，{symbol2} 失败")
+            print(f"  正在紧急平仓 {symbol1}...")
+
+            # 根据信号方向确定平仓方向
+            if signal['action'] == 'SHORT_LONG':
+                # 做空symbol1，需要买入平仓
+                close_side = 'BUY'
+            else:  # LONG_SHORT
+                # 做多symbol1，需要卖出平仓
+                close_side = 'SELL'
+
+            # 紧急平仓第一个订单
+            close_success = self.emergency_close_position(
+                symbol1, close_side, quantity1, f"配对交易失败，{symbol2}下单失败"
+            )
+
+            if close_success:
+                print(f"✓ 紧急平仓成功，风险已控制")
+            else:
+                print(f"✗ 紧急平仓失败，请手动处理 {symbol1} 仓位")
+
+            return None
+        elif order2 and order2.get('orderId') and (not order1 or not order1.get('orderId')):
+            # 第二个订单成功，第一个订单失败
+            print(f"配对交易失败: {symbol2} 成功，{symbol1} 失败")
+            print(f"  正在紧急平仓 {symbol2}...")
+
+            # 根据信号方向确定平仓方向
+            if signal['action'] == 'SHORT_LONG':
+                # 做多symbol2，需要卖出平仓
+                close_side = 'SELL'
+            else:  # LONG_SHORT
+                # 做空symbol2，需要买入平仓
+                close_side = 'BUY'
+
+            # 紧急平仓第二个订单
+            close_success = self.emergency_close_position(
+                symbol2, close_side, quantity2, f"配对交易失败，{symbol1}下单失败"
+            )
+
+            if close_success:
+                print(f"✓ 紧急平仓成功，风险已控制")
+            else:
+                print(f"✗ 紧急平仓失败，请手动处理 {symbol2} 仓位")
+
+            return None
+        else:
+            print(f"下单失败: {symbol1} 或 {symbol2} 订单未成功提交")
+            if order1:
+                print(f"  {symbol1} 订单: {order1}")
+            if order2:
+                print(f"  {symbol2} 订单: {order2}")
+            return None
+
+    def check_exit_conditions(self, pair_info, current_prices, current_z_score, timestamp, current_spread):
+        """检查平仓条件（包含止盈止损）"""
+        pair_name = pair_info['pair_name']
+        if pair_name not in self.positions:
+            return False, ""
+
+        position = self.positions[pair_name]
+        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+        price1, price2 = current_prices[symbol1], current_prices[symbol2]
+        cs1 = position.get('contract_size1', coin_m_contract_size(symbol1))
+        cs2 = position.get('contract_size2', coin_m_contract_size(symbol2))
+        pnl1 = inverse_pnl_coin(position['symbol1_size'], cs1, position['entry_prices'][symbol1], price1)
+        pnl2 = inverse_pnl_coin(position['symbol2_size'], cs2, position['entry_prices'][symbol2], price2)
+        total_pnl = pnl1 + pnl2
+        close_fee = (
+            inverse_fee_coin(abs(position['symbol1_size']), cs1, price1, self.trading_fee_rate)
+            + inverse_fee_coin(abs(position['symbol2_size']), cs2, price2, self.trading_fee_rate)
+        )
+        net_pnl = total_pnl - close_fee
+        entry_notional = position.get('notional_coin', 0.0)
+        if entry_notional <= 0:
+            entry_notional = (
+                abs(position['symbol1_size']) * cs1 / position['entry_prices'][symbol1]
+                + abs(position['symbol2_size']) * cs2 / position['entry_prices'][symbol2]
+            )
+
+        if abs(current_z_score) < self.z_exit_threshold:
+            return True, f"Z-score回归到{current_z_score:.3f}，平仓获利"
+
+        holding_hours = (timestamp - position['entry_time']).total_seconds() / 3600
+        if holding_hours > self.max_holding_hours:
+            return True, f"持仓时间过长({holding_hours:.1f}小时)，强制平仓"
+
+        if entry_notional > 0:
+            pnl_percentage = net_pnl / entry_notional
+            if net_pnl > 0 and pnl_percentage > self.take_profit_pct:
+                return True, f"止盈触发({pnl_percentage * 100:.1f}%)，平仓获利"
+            if net_pnl < 0 and pnl_percentage < -self.stop_loss_pct:
+                return True, f"止损触发({pnl_percentage * 100:.1f}%)，平仓止损"
+
+        return False, ""
+
+    def close_position(self, pair_info, current_prices, reason, timestamp, current_spread):
+        """平仓（支持单边失败时的恢复逻辑）"""
+        pair_name = pair_info['pair_name']
+        if pair_name not in self.positions:
+            return None
+
+        position = self.positions[pair_name]
+        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+        close_px = self._pair_close_prices(symbol1, symbol2, current_prices)
+        if symbol1 not in close_px or symbol2 not in close_px:
+            print(f"平仓失败: {pair_name} 两腿没有可用平仓价")
+            return None
+        price1, price2 = close_px[symbol1], close_px[symbol2]
+        asset = position.get('settlement_asset', self.settlement_asset)
+        cs1 = position.get('contract_size1', coin_m_contract_size(symbol1))
+        cs2 = position.get('contract_size2', coin_m_contract_size(symbol2))
+        pnl1 = inverse_pnl_coin(position['symbol1_size'], cs1, position['entry_prices'][symbol1], price1)
+        pnl2 = inverse_pnl_coin(position['symbol2_size'], cs2, position['entry_prices'][symbol2], price2)
+        total_pnl = pnl1 + pnl2
+        close_fee = (
+            inverse_fee_coin(abs(position['symbol1_size']), cs1, price1, self.trading_fee_rate)
+            + inverse_fee_coin(abs(position['symbol2_size']), cs2, price2, self.trading_fee_rate)
+        )
+        net_pnl = total_pnl - close_fee
+
+        # 执行平仓订单（双向持仓：平空 BUY+SHORT，平多 SELL+LONG）
+        side1 = 'BUY' if position['symbol1_size'] < 0 else 'SELL'
+        side2 = 'BUY' if position['symbol2_size'] < 0 else 'SELL'
+        ps1 = 'SHORT' if side1 == 'BUY' else 'LONG'
+        ps2 = 'SHORT' if side2 == 'BUY' else 'LONG'
+        close_order1 = self.binance_api.place_order(
+            symbol1,
+            side1,
+            abs(position['symbol1_size']),
+            position_side=ps1
+        )
+        close_order2 = self.binance_api.place_order(
+            symbol2,
+            side2,
+            abs(position['symbol2_size']),
+            position_side=ps2
+        )
+
+        def _add_pending_recovery(remaining_symbol, remaining_side, remaining_quantity):
+            """将未平仓的一边加入待恢复列表，后续每10秒尝试平仓"""
+            self.pending_recovery_close[pair_name] = {
+                'symbol': remaining_symbol,
+                'side': remaining_side,
+                'quantity': remaining_quantity
+            }
+            del self.positions[pair_name]
+            print(f"   单边平仓失败: {remaining_symbol} 未平仓，已加入待恢复列表（每10秒重试）")
+
+        if close_order1 and close_order2:
+            # 两个订单都提交成功，等待成交
+            success, status1, status2 = self.wait_for_orders_completion(
+                close_order1, close_order2, symbol1, symbol2, max_wait=30
+            )
+            if success:
+                # 两边都成交，正常完成平仓
+                trade = {
+                    'timestamp': timestamp,
+                    'pair': pair_name,
+                    'action': 'CLOSE',
+                    'symbol1': symbol1,
+                    'symbol2': symbol2,
+                    'symbol1_size': -position['symbol1_size'],
+                    'symbol2_size': -position['symbol2_size'],
+                    'symbol1_price': price1,
+                    'symbol2_price': price2,
+                    'hedge_ratio': position['hedge_ratio'],
+                    'signal': {'action': 'CLOSE', 'description': reason},
+                    'pnl': net_pnl,
+                    'gross_pnl': total_pnl,
+                    'holding_hours': (timestamp - position['entry_time']).total_seconds() / 3600,
+                    'settlement_asset': asset,
+                }
+                self.trades.append(trade)
+                print(f"实盘平仓: {pair_name}")
+                print(f"   平仓原因: {reason}")
+                print(f"   毛盈亏: {total_pnl:.8f} {asset}")
+                print(f"   净盈亏: {net_pnl:.8f} {asset}")
+                print(f"   持仓时间: {trade['holding_hours']:.1f}小时")
+                del self.positions[pair_name]
+                return trade
+            else:
+                # 一方或双方成交失败，需判断哪边未平仓
+                fill1 = status1 and status1.get('status') in ['FILLED', 'PARTIALLY_FILLED'] if status1 else False
+                fill2 = status2 and status2.get('status') in ['FILLED', 'PARTIALLY_FILLED'] if status2 else False
+                if fill1 and not fill2:
+                    # symbol1 已平，symbol2 未平
+                    _add_pending_recovery(
+                        symbol2,
+                        'BUY' if position['symbol2_size'] < 0 else 'SELL',
+                        abs(position['symbol2_size'])
+                    )
+                elif fill2 and not fill1:
+                    # symbol2 已平，symbol1 未平
+                    _add_pending_recovery(
+                        symbol1,
+                        'BUY' if position['symbol1_size'] < 0 else 'SELL',
+                        abs(position['symbol1_size'])
+                    )
+                # 两边都未成交则保持原持仓，下一周期重试
+                return None
+
+        elif close_order1 and close_order1.get('orderId') and (not close_order2 or not close_order2.get('orderId')):
+            # 仅 order1 提交成功，order2 提交失败
+            success, _, _ = self.wait_for_orders_completion(close_order1, None, symbol1, None, max_wait=30)
+            if success:
+                _add_pending_recovery(
+                    symbol2,
+                    'BUY' if position['symbol2_size'] < 0 else 'SELL',
+                    abs(position['symbol2_size'])
+                )
+            # order1 也未成交则保持原持仓
+            return None
+
+        elif close_order2 and close_order2.get('orderId') and (not close_order1 or not close_order1.get('orderId')):
+            # 仅 order2 提交成功，order1 提交失败
+            success, _, _ = self.wait_for_orders_completion(close_order2, None, symbol2, None, max_wait=30)
+            if success:
+                _add_pending_recovery(
+                    symbol1,
+                    'BUY' if position['symbol1_size'] < 0 else 'SELL',
+                    abs(position['symbol1_size'])
+                )
+            return None
+
+        return None
+
+    def wait_for_orders_completion(self, order1, order2, symbol1, symbol2, max_wait=30):
+        """等待订单成交（支持单个订单）"""
+        # 如果order2为None，只等待order1
+        if order2 is None:
+            for i in range(max_wait):
+                try:
+                    status1 = self.binance_api.get_order_status(order1['orderId'], symbol1)
+                    if status1:
+                        status1_str = status1.get('status', 'UNKNOWN')
+                        if status1_str in ['FILLED', 'PARTIALLY_FILLED']:
+                            return True, status1, None
+                        elif status1_str in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                            return False, status1, None
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"查询订单状态异常: {str(e)}")
+                    time.sleep(1)
+            return False, None, None
+
+        # 两个订单的情况
+        for i in range(max_wait):
+            try:
+                status1 = self.binance_api.get_order_status(order1['orderId'], symbol1)
+                status2 = self.binance_api.get_order_status(order2['orderId'], symbol2)
+
+                if status1 and status2:
+                    status1_str = status1.get('status', 'UNKNOWN')
+                    status2_str = status2.get('status', 'UNKNOWN')
+
+                    if status1_str in ['FILLED', 'PARTIALLY_FILLED'] and \
+                            status2_str in ['FILLED', 'PARTIALLY_FILLED']:
+                        return True, status1, status2
+
+                    elif status1_str in ['CANCELED', 'REJECTED', 'EXPIRED'] or \
+                            status2_str in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                        return False, status1, status2
+
+                time.sleep(1)
+            except Exception as e:
+                print(f"查询订单状态异常: {str(e)}")
+                time.sleep(1)
+
+        return False, None, None
+
+    def emergency_close_position(self, symbol, side, quantity, reason="紧急平仓"):
+        """紧急平仓单个仓位"""
+        try:
+            print(f"  紧急平仓: {symbol} {side} {quantity} - 原因: {reason}")
+
+            # 执行平仓订单
+            ps = 'SHORT' if side == 'BUY' else 'LONG'
+            order = self.binance_api.place_order(symbol, side, quantity, position_side=ps)
+
+            if order and order.get('orderId'):
+                print(f"  紧急平仓订单已提交: {symbol} {side} {quantity}")
+
+                # 等待平仓订单成交
+                success, final_status, _ = self.wait_for_orders_completion(
+                    order, None, symbol, None, max_wait=10
+                )
+
+                if success:
+                    print(f"  ✓ 紧急平仓成功: {symbol}")
+                    return True
+                else:
+                    print(f"  ✗ 紧急平仓失败: {symbol}")
+                    return False
+            else:
+                print(f"  ✗ 紧急平仓订单提交失败: {symbol}")
+                return False
+
+        except Exception as e:
+            print(f"✗ 紧急平仓异常: {symbol} - {str(e)}")
+            return False
+
+    def process_pending_recovery_close(self):
+        """
+        处理待恢复平仓列表：每10秒由交易循环调用，持续尝试平掉单边平仓失败后剩余的腿
+        不依赖K线周期，尽快消除单边持仓风险
+        """
+        if not self.pending_recovery_close:
+            return
+
+        for pair_name in list(self.pending_recovery_close.keys()):
+            pending = self.pending_recovery_close[pair_name]
+            symbol = pending['symbol']
+            side = pending['side']
+            quantity = pending['quantity']
+
+            print(f"\n  [恢复平仓] 尝试平仓 {pair_name} 的剩余腿: {symbol} {side} {quantity}")
+            success = self.emergency_close_position(
+                symbol, side, quantity,
+                reason=f"单边平仓恢复-{pair_name}"
+            )
+            if success:
+                del self.pending_recovery_close[pair_name]
+                print(f"  [恢复平仓] ✓ {pair_name} 已完全平仓")
+
+    def update_capital_curve(self):
+        """更新资金曲线"""
+        try:
+            account_info = self.binance_api.get_account_info()
+            if account_info:
+                self.current_capital = dapi_asset_balance(account_info, self.settlement_asset)
+        except Exception as e:
+            print(f"更新资金曲线时获取账户信息失败: {str(e)}")
+
+        self.capital_curve.append({
+            'timestamp': datetime.now(),
+            'capital': self.current_capital,
+            'positions_count': len(self.positions)
+        })
+
+    def get_trading_status(self):
+        """获取交易状态"""
+        return {
+            'running': self.running,
+            'current_capital': self.current_capital,
+            'initial_capital': self.initial_capital,
+            'total_return': (self.current_capital - self.initial_capital) / self.initial_capital * 100,
+            'positions_count': len(self.positions),
+            'total_trades': len(self.trades),
+            'positions': self.positions,
+            'recent_trades': self.trades[-5:] if self.trades else []
+        }
+
+
+# ==================== Flask Web服务器 ====================
+
+class LiveTradingServer:
+    """实盘交易Web服务器"""
+
+    def __init__(self, trading_strategy):
+        self.trading_strategy = trading_strategy
+        self.app = Flask(__name__,
+                         template_folder='templates',
+                         static_folder='static',
+                         static_url_path='/static')
+        self.app.secret_key = 'your-secret-key-change-in-production'  # 生产环境请更改
+        CORS(self.app)
+        self.init_database()
+        self.setup_routes()
+
+    def init_database(self):
+        """初始化数据库"""
+        conn = sqlite3.connect('trading_system.db')
+        c = conn.cursor()
+
+        # 用户表
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      username TEXT UNIQUE NOT NULL,
+                      email TEXT UNIQUE NOT NULL,
+                      password_hash TEXT NOT NULL,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+        # 订阅表
+        c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER NOT NULL,
+                      plan_type TEXT NOT NULL,
+                      amount REAL NOT NULL,
+                      payment_method TEXT,
+                      status TEXT DEFAULT 'active',
+                      start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      end_date TIMESTAMP,
+                      FOREIGN KEY (user_id) REFERENCES users (id))''')
+
+        # API配置表
+        c.execute('''CREATE TABLE IF NOT EXISTS api_configs
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER NOT NULL,
+                      api_key TEXT NOT NULL,
+                      secret_key TEXT NOT NULL,
+                      base_url TEXT DEFAULT 'https://testnet.binancefuture.com',
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      FOREIGN KEY (user_id) REFERENCES users (id))''')
+
+        conn.commit()
+        conn.close()
+
+    def get_db(self):
+        """获取数据库连接"""
+        conn = sqlite3.connect('trading_system.db')
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def login_required(self, f):
+        """登录装饰器"""
+
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return f(*args, **kwargs)
+
+        return decorated_function
+
+    def subscription_required(self, f):
+        """订阅检查装饰器"""
+
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('''SELECT * FROM subscriptions 
+                         WHERE user_id = ? AND status = 'active' 
+                         AND (end_date IS NULL OR end_date > datetime('now'))
+                         ORDER BY end_date DESC LIMIT 1''',
+                      (session['user_id'],))
+            subscription = c.fetchone()
+            conn.close()
+
+            if not subscription:
+                return redirect(url_for('subscribe'))
+            return f(*args, **kwargs)
+
+        return decorated_function
+
+    def setup_routes(self):
+        """设置路由"""
+
+        # ========== 用户系统路由 ==========
+        @self.app.route('/')
+        def index():
+            """首页 - 统计套利介绍"""
+            return render_template('index.html')
+
+        @self.app.route('/login', methods=['GET', 'POST'])
+        def login():
+            """登录页面"""
+            if request.method == 'POST':
+                username = request.form.get('username')
+                password = request.form.get('password')
+
+                conn = self.get_db()
+                c = conn.cursor()
+                c.execute('SELECT * FROM users WHERE username = ?', (username,))
+                user = c.fetchone()
+                conn.close()
+
+                if user and check_password_hash(user['password_hash'], password):
+                    session['user_id'] = user['id']
+                    session['username'] = user['username']
+                    return redirect(url_for('subscribe'))
+                else:
+                    flash('用户名或密码错误', 'error')
+
+            return render_template('login.html')
+
+        @self.app.route('/register', methods=['GET', 'POST'])
+        def register():
+            """注册页面"""
+            if request.method == 'POST':
+                username = request.form.get('username')
+                email = request.form.get('email')
+                password = request.form.get('password')
+                confirm_password = request.form.get('confirm_password')
+
+                if password != confirm_password:
+                    flash('两次输入的密码不一致', 'error')
+                    return render_template('register.html')
+
+                conn = self.get_db()
+                c = conn.cursor()
+
+                # 检查用户名是否已存在
+                c.execute('SELECT * FROM users WHERE username = ?', (username,))
+                if c.fetchone():
+                    conn.close()
+                    flash('用户名已存在', 'error')
+                    return render_template('register.html')
+
+                # 检查邮箱是否已存在
+                c.execute('SELECT * FROM users WHERE email = ?', (email,))
+                if c.fetchone():
+                    conn.close()
+                    flash('邮箱已被注册', 'error')
+                    return render_template('register.html')
+
+                # 创建新用户
+                password_hash = generate_password_hash(password)
+                c.execute('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+                          (username, email, password_hash))
+                conn.commit()
+                user_id = c.lastrowid
+                conn.close()
+
+                session['user_id'] = user_id
+                session['username'] = username
+                return redirect(url_for('subscribe'))
+
+            return render_template('register.html')
+
+        @self.app.route('/logout')
+        def logout():
+            """登出"""
+            session.clear()
+            return redirect(url_for('index'))
+
+        # ========== 订阅系统路由 ==========
+        @self.app.route('/subscribe')
+        @self.login_required
+        def subscribe():
+            """订阅页面"""
+            # 检查是否已有有效订阅
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('''SELECT * FROM subscriptions 
+                         WHERE user_id = ? AND status = 'active' 
+                         AND (end_date IS NULL OR end_date > datetime('now'))
+                         ORDER BY end_date DESC LIMIT 1''',
+                      (session['user_id'],))
+            subscription = c.fetchone()
+            conn.close()
+
+            if subscription:
+                return redirect(url_for('api_config'))
+
+            return render_template('subscribe.html')
+
+        @self.app.route('/api/payment', methods=['POST'])
+        @self.login_required
+        def payment():
+            """处理支付（模拟）"""
+            data = request.json
+            plan_type = data.get('plan_type')  # 'monthly' 或 'yearly'
+            payment_method = data.get('payment_method')  # 'alipay' 或 'wechat'
+
+            if plan_type not in ['monthly', 'yearly']:
+                return jsonify({'success': False, 'message': '无效的订阅类型'}), 400
+
+            if payment_method not in ['alipay', 'wechat']:
+                return jsonify({'success': False, 'message': '无效的支付方式'}), 400
+
+            # 计算金额和结束日期
+            if plan_type == 'monthly':
+                amount = 200.0
+                end_date = datetime.now() + timedelta(days=30)
+            else:
+                amount = 1500.0
+                end_date = datetime.now() + timedelta(days=365)
+
+            # 模拟支付处理（实际应用中这里会调用支付API）
+            # 这里直接返回成功
+
+            # 保存订阅信息
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('''INSERT INTO subscriptions (user_id, plan_type, amount, payment_method, end_date)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (session['user_id'], plan_type, amount, payment_method, end_date))
+            conn.commit()
+            conn.close()
+
+            return jsonify({
+                'success': True,
+                'message': '支付成功',
+                'redirect': url_for('api_config')
+            })
+
+        # ========== API配置路由 ==========
+        @self.app.route('/api/config', methods=['GET', 'POST'])
+        @self.login_required
+        @self.subscription_required
+        def api_config():
+            """API配置页面"""
+            if request.method == 'POST':
+                api_key = request.form.get('api_key')
+                secret_key = request.form.get('secret_key')
+                base_url = request.form.get('base_url', 'https://testnet.binancefuture.com')
+
+                if not api_key or not secret_key:
+                    flash('API Key和Secret Key不能为空', 'error')
+                    return render_template('api_config.html')
+
+                conn = self.get_db()
+                c = conn.cursor()
+
+                # 检查是否已有配置
+                c.execute('SELECT * FROM api_configs WHERE user_id = ?', (session['user_id'],))
+                existing = c.fetchone()
+
+                if existing:
+                    # 更新配置
+                    c.execute('''UPDATE api_configs 
+                                 SET api_key = ?, secret_key = ?, base_url = ?, updated_at = CURRENT_TIMESTAMP
+                                 WHERE user_id = ?''',
+                              (api_key, secret_key, base_url, session['user_id']))
+                else:
+                    # 创建新配置
+                    c.execute('''INSERT INTO api_configs (user_id, api_key, secret_key, base_url)
+                                 VALUES (?, ?, ?, ?)''',
+                              (session['user_id'], api_key, secret_key, base_url))
+
+                conn.commit()
+                conn.close()
+
+                flash('API配置保存成功', 'success')
+                return redirect(url_for('monitor'))
+
+            # GET请求 - 显示配置页面
+            conn = self.get_db()
+            c = conn.cursor()
+            c.execute('SELECT * FROM api_configs WHERE user_id = ?', (session['user_id'],))
+            config = c.fetchone()
+            conn.close()
+
+            return render_template('api_config.html', config=config)
+
+        # ========== 监控页面路由 ==========
+        @self.app.route('/monitor')
+        @self.login_required
+        @self.subscription_required
+        def monitor():
+            """实时监控页面"""
+            return render_template('monitor.html')
+
+        # ========== 交易API路由 ==========
+        @self.app.route('/api/status')
+        @self.login_required
+        @self.subscription_required
+        def get_status():
+            """获取交易状态"""
+            return jsonify(self.trading_strategy.get_trading_status())
+
+        @self.app.route('/api/positions')
+        @self.login_required
+        @self.subscription_required
+        def get_positions():
+            """获取当前持仓"""
+            return jsonify(self.trading_strategy.positions)
+
+        @self.app.route('/api/trades')
+        @self.login_required
+        @self.subscription_required
+        def get_trades():
+            """获取交易记录"""
+            return jsonify(self.trading_strategy.trades)
+
+        @self.app.route('/api/capital_curve')
+        @self.login_required
+        @self.subscription_required
+        def get_capital_curve():
+            """获取资金曲线"""
+            return jsonify(self.trading_strategy.capital_curve)
+
+        @self.app.route('/api/monitor/data')
+        @self.login_required
+        @self.subscription_required
+        def monitor_data():
+            """获取监控数据API"""
+            # 从币安API实时获取账户信息
+            account_info = None
+            try:
+                account_info = self.trading_strategy.binance_api.get_account_info()
+            except Exception as e:
+                print(f"获取账户信息失败: {str(e)}")
+
+            # 解析账户信息
+            balance = 0.0
+            equity = 0.0
+            available = 0.0
+
+            if account_info:
+                asset = self.trading_strategy.settlement_asset
+                balance = dapi_wallet_balance(account_info, asset)
+                available = dapi_asset_balance(account_info, asset)
+                unrealized_profit = 0.0
+                for item in account_info.get('assets') or []:
+                    if str(item.get('asset', '')).upper() == str(asset).upper():
+                        try:
+                            unrealized_profit = float(item.get('unrealizedProfit') or 0)
+                        except (TypeError, ValueError):
+                            unrealized_profit = 0.0
+                        break
+                equity = balance + unrealized_profit
+
+            status = self.trading_strategy.get_trading_status()
+            return jsonify({
+                'status': 'running' if self.trading_strategy.running else 'stopped',
+                'pairs': [],
+                'positions': list(self.trading_strategy.positions.values()) if self.trading_strategy.positions else [],
+                'account': {
+                    'balance': balance,
+                    'equity': equity,
+                    'available': available
+                }
+            })
+
+        @self.app.route('/api/start_trading', methods=['POST'])
+        @self.login_required
+        @self.subscription_required
+        def start_trading():
+            """开始交易"""
+            if not self.trading_strategy.running:
+                self.trading_strategy.running = True
+                return jsonify({'status': 'success', 'message': '交易已开始'})
+            else:
+                return jsonify({'status': 'error', 'message': '交易已在运行中'})
+
+        @self.app.route('/api/stop_trading', methods=['POST'])
+        @self.login_required
+        @self.subscription_required
+        def stop_trading():
+            """停止交易"""
+            if self.trading_strategy.running:
+                self.trading_strategy.running = False
+                return jsonify({'status': 'success', 'message': '交易已停止'})
+            else:
+                return jsonify({'status': 'error', 'message': '交易未在运行'})
+
+    def run(self, host='0.0.0.0', port=5000, debug=False):
+        """运行服务器"""
+        print(f"启动实盘交易Web服务器: http://{host}:{port}")
+        self.app.run(host=host, port=port, debug=debug)
+
+
+# ==================== 策略选择函数 ====================
+
+def select_z_score_strategy():
+    """
+    选择Z-score计算策略
+
+    Returns:
+        BaseZScoreStrategy: 选择的策略对象，如果失败返回None
+    """
+    if not STRATEGIES_AVAILABLE:
+        print("警告: 策略模块不可用，将使用传统方法")
+        return None
+
+    print("\n" + "=" * 60)
+    print("选择Z-score计算策略")
+    print("=" * 60)
+    print("请选择Z-score计算策略:")
+    print("  1. 传统方法（均值和标准差）")
+
+    # 检查ARIMA-GARCH是否可用
+    arima_garch_available = ARIMA_AVAILABLE and GARCH_AVAILABLE
+    if arima_garch_available:
+        print("  2. ARIMA-GARCH模型")
+    else:
+        print("  2. ARIMA-GARCH模型（不可用：缺少必要的库）")
+
+    # 检查ECM是否可用
+    ecm_available = STRATEGIES_AVAILABLE and STATSMODELS_AVAILABLE
+    if ecm_available:
+        print("  3. ECM误差修正模型（推荐用于协整交易）")
+    else:
+        print("  3. ECM误差修正模型（不可用：缺少必要的库）")
+
+    # 检查Kalman Filter是否可用
+    kalman_available = STRATEGIES_AVAILABLE
+    if kalman_available:
+        print("  4. Kalman Filter动态价差模型（推荐用于动态市场）")
+    else:
+        print("  4. Kalman Filter动态价差模型（不可用：缺少必要的库）")
+
+    # 检查Copula + DCC-GARCH是否可用
+    copula_dcc_available = STRATEGIES_AVAILABLE and GARCH_AVAILABLE
+    if copula_dcc_available:
+        print("  5. Copula + DCC-GARCH相关性/波动率模型（推荐用于相关性建模）")
+    else:
+        print("  5. Copula + DCC-GARCH相关性/波动率模型（不可用：缺少必要的库）")
+
+    # 检查Regime-Switching是否可用
+    regime_switching_available = STRATEGIES_AVAILABLE and STATSMODELS_AVAILABLE
+    if regime_switching_available:
+        print("  6. Regime-Switching市场状态模型（推荐用于状态转换市场）")
+    else:
+        print("  6. Regime-Switching市场状态模型（不可用：缺少必要的库）")
+
+    print("  0. 退出程序")
+
+    # 确定最大选择数
+    max_choice = 6
+
+    while True:
+        try:
+            choice = input(f"请选择 (0-{max_choice}): ").strip()
+
+            if choice == '0':
+                return None
+
+            if choice == '1':
+                strategy = TraditionalZScoreStrategy()
+                print(f"已选择: {strategy.get_strategy_description()}")
+                return strategy
+
+            if choice == '2' and arima_garch_available:
+                # 询问ARIMA和GARCH参数
+                print("\n配置ARIMA-GARCH模型参数:")
+                print("  直接回车使用默认值: ARIMA(1,0,1), GARCH(1,1)")
+
+                arima_input = input("ARIMA阶数 (p,d,q，格式如: 1,0,1): ").strip()
+                if arima_input:
+                    try:
+                        arima_parts = [int(x.strip()) for x in arima_input.split(',')]
+                        if len(arima_parts) == 3:
+                            arima_order = tuple(arima_parts)
+                        else:
+                            print("输入格式错误，使用默认值")
+                            arima_order = (1, 0, 1)
+                    except ValueError:
+                        print("输入格式错误，使用默认值")
+                        arima_order = (1, 0, 1)
+                else:
+                    arima_order = (1, 0, 1)
+
+                garch_input = input("GARCH阶数 (p,q，格式如: 1,1): ").strip()
+                if garch_input:
+                    try:
+                        garch_parts = [int(x.strip()) for x in garch_input.split(',')]
+                        if len(garch_parts) == 2:
+                            garch_order = tuple(garch_parts)
+                        else:
+                            print("输入格式错误，使用默认值")
+                            garch_order = (1, 1)
+                    except ValueError:
+                        print("输入格式错误，使用默认值")
+                        garch_order = (1, 1)
+                else:
+                    garch_order = (1, 1)
+
+                try:
+                    strategy = ArimaGarchZScoreStrategy(arima_order=arima_order, garch_order=garch_order)
+                    print(f"已选择: {strategy.get_strategy_description()}")
+                    return strategy
+                except Exception as e:
+                    print(f"ARIMA-GARCH策略初始化失败: {str(e)}")
+                    print("请重新选择")
+                    continue
+
+            if choice == '3' and ecm_available:
+                try:
+                    strategy = EcmZScoreStrategy()
+                    print(f"已选择: {strategy.get_strategy_description()}")
+                    return strategy
+                except Exception as e:
+                    print(f"ECM策略初始化失败: {str(e)}")
+                    print("请重新选择")
+                    continue
+
+            if choice == '4' and kalman_available:
+                print("\n配置Kalman Filter参数:")
+                print("  直接回车使用默认值")
+
+                process_var_input = input("过程噪声方差 (默认0.01): ").strip()
+                process_variance = float(process_var_input) if process_var_input else 0.01
+
+                obs_var_input = input("观测噪声方差 (默认0.1): ").strip()
+                observation_variance = float(obs_var_input) if obs_var_input else 0.1
+
+                try:
+                    strategy = KalmanFilterZScoreStrategy(
+                        process_variance=process_variance,
+                        observation_variance=observation_variance
+                    )
+                    print(f"已选择: {strategy.get_strategy_description()}")
+                    return strategy
+                except Exception as e:
+                    print(f"Kalman Filter策略初始化失败: {str(e)}")
+                    print("请重新选择")
+                    continue
+
+            if choice == '5' and copula_dcc_available:
+                try:
+                    strategy = CopulaDccGarchZScoreStrategy()
+                    print(f"已选择: {strategy.get_strategy_description()}")
+                    return strategy
+                except Exception as e:
+                    print(f"Copula + DCC-GARCH策略初始化失败: {str(e)}")
+                    print("请重新选择")
+                    continue
+
+            if choice == '6' and regime_switching_available:
+                # 询问Regime-Switching参数
+                print("\n配置Regime-Switching市场状态模型参数:")
+                print("  直接回车使用默认值")
+
+                n_regimes_input = input("状态数量 (默认2): ").strip()
+                if n_regimes_input:
+                    try:
+                        n_regimes = int(n_regimes_input)
+                        if n_regimes < 2:
+                            print("状态数量至少为2，使用默认值2")
+                            n_regimes = 2
+                    except ValueError:
+                        print("输入格式错误，使用默认值2")
+                        n_regimes = 2
+                else:
+                    n_regimes = 2
+
+                smoothing_input = input("是否使用平滑概率? (y/n, 默认y): ").strip().lower()
+                smoothing = smoothing_input != 'n'
+
+                try:
+                    strategy = RegimeSwitchingZScoreStrategy(
+                        n_regimes=n_regimes,
+                        smoothing=smoothing
+                    )
+                    print(f"已选择: {strategy.get_strategy_description()}")
+                    return strategy
+                except Exception as e:
+                    print(f"Regime-Switching策略初始化失败: {str(e)}")
+                    print("请重新选择")
+                    continue
+
+            print(f"无效选择，请输入 0-{max_choice} 之间的数字")
+
+        except KeyboardInterrupt:
+            print("\n用户取消选择")
+            return None
+        except Exception as e:
+            print(f"选择失败: {str(e)}，请重新选择")
+
+
+# ==================== 币对配置 ====================
+
+def get_pairs_config():
+    """获取币对配置（用户输入）"""
+    print("\n" + "=" * 80)
+    print("币对配置")
+    print("=" * 80)
+
+    pairs_config = []
+
+    print("请配置要交易的币对（从回测结果中获得的对冲比率等信息）")
+    print("可以配置多个币对，输入空行结束配置")
+
+    pair_count = 0
+    while True:
+        pair_count += 1
+        print(f"\n--- 配置第 {pair_count} 个币对 ---")
+
+        # 输入symbol1
+        symbol1 = input("请输入近月合约（如: SOLUSD_260925）: ").strip().upper()
+        if not symbol1:
+            if pair_count == 1:
+                print("至少需要配置一个币对")
+                continue
+            else:
+                break
+
+        # 输入symbol2
+        symbol2 = input("请输入远月合约（如: SOLUSD_261225）: ").strip().upper()
+        if not symbol2:
+            print("第二个交易对不能为空，请重新输入")
+            pair_count -= 1
+            continue
+
+        base1, base2 = parse_coin_m_base(symbol1), parse_coin_m_base(symbol2)
+        if base1 != base2:
+            print(f"两腿结算币必须相同（当前 {base1}/{base2}），币本位钱包不能混用，请重新输入")
+            pair_count -= 1
+            continue
+        if parse_delivery_expiry_date(symbol1) is None or parse_delivery_expiry_date(symbol2) is None:
+            print("请使用交割合约代码，例如 SOLUSD_260925，不要用 SOLUSDT 永续/U本位")
+            pair_count -= 1
+            continue
+        if "USDT" in symbol1.split("_")[0] or "USDT" in symbol2.split("_")[0]:
+            print("这是 U 本位线性合约代码，币本位实盘请用 XXXUSD_YYMMDD")
+            pair_count -= 1
+            continue
+
+        # 选择是否使用差分数据
+        print("\n请选择价差计算方式（必须与回测时使用的方法一致）:")
+        print("  0. 原始数据（原始价差）")
+        print("  1. 一阶差分（一阶差分价差）")
+        print("  2. 二阶差分（二阶差分价差）")
+        print("\n注意：")
+        print("  - 如果选择原始数据，对冲比率应该从原始价格计算得出")
+        print("  - 如果选择一阶差分，对冲比率应该从一阶差分价格计算得出")
+        print("  - 如果选择二阶差分，对冲比率应该从二阶差分价格计算得出")
+
+        while True:
+            diff_choice = input("请选择 (0/1/2，默认0): ").strip()
+            if not diff_choice:
+                diff_order = 0
+                break
+            elif diff_choice in ['0', '1', '2']:
+                diff_order = int(diff_choice)
+                break
+            else:
+                print("无效选择，请输入 0、1 或 2")
+
+        # 根据选择的价差类型提示对冲比率来源
+        if diff_order == 0:
+            hedge_ratio_hint = "原始价格计算的对冲比率"
+        elif diff_order == 1:
+            hedge_ratio_hint = "一阶差分价格计算的对冲比率"
+        else:
+            hedge_ratio_hint = "二阶差分价格计算的对冲比率"
+
+        # 输入对冲比率
+        print(f"\n请输入对冲比率（从回测结果中获得，使用{hedge_ratio_hint}）")
+        while True:
+            hedge_ratio_input = input(f"对冲比率（如: 1.787595）: ").strip()
+            if hedge_ratio_input:
+                try:
+                    hedge_ratio = float(hedge_ratio_input)
+                    break
+                except ValueError:
+                    print("输入无效，请输入数字")
+            else:
+                print("对冲比率不能为空")
+
+        # 构建币对配置
+        pair_name = f"{symbol1}/{symbol2}"
+        pair_config = {
+            'pair_name': pair_name,
+            'symbol1': symbol1,
+            'symbol2': symbol2,
+            'hedge_ratio': hedge_ratio,
+            'diff_order': diff_order,
+            'cointegration_found': True,
+        }
+
+        pairs_config.append(pair_config)
+
+        print(f"\n 已添加币对: {pair_name}")
+        print(f"  对冲比率: {hedge_ratio:.6f}")
+        diff_type = '原始价差' if diff_order == 0 else f"{diff_order}阶差分价差"
+        print(f"  价差类型: {diff_type}")
+
+        # 询问是否继续添加
+        continue_input = input("\n是否继续添加币对？(y/n，默认n): ").strip().lower()
+        if continue_input != 'y':
+            break
+
+    if not pairs_config:
+        print("未配置任何币对")
+        return []
+
+    print("\n" + "=" * 80)
+    print("已配置的币对:")
+    print("=" * 80)
+    for i, pair in enumerate(pairs_config, 1):
+        diff_type = '原始价差' if pair['diff_order'] == 0 else f"{pair['diff_order']}阶差分价差"
+        print(f"{i}. {pair['pair_name']}")
+        print(f"   对冲比率: {pair['hedge_ratio']:.6f}")
+        print(f"   价差类型: {diff_type}")
+
+    return pairs_config
+
+
+# ==================== 交易参数配置 ====================
+
+def configure_trading_parameters():
+    """配置交易参数"""
+    print("\n" + "=" * 80)
+    print("交易参数配置")
+    print("=" * 80)
+
+    # 默认参数
+    default_params = {
+        'lookback_period': 60,
+        'z_threshold': 1.5,
+        'z_exit_threshold': 0.6,
+        'take_profit_pct': 0.15,
+        'stop_loss_pct': 0.08,
+        'max_holding_hours': 168,
+        'position_ratio': 0.5,
+        'leverage': 5,
+        'trading_fee_rate': 0.0005,
+        'expiry_no_entry_days': 7,
+        'expiry_force_close_days': 3,
+    }
+
+    print("当前默认参数（币本位：保证金/盈亏为结算币，下单单位为张）:")
+    print(f"  1. 回看期: {default_params['lookback_period']}")
+    print(f"  2. Z-score开仓阈值: {default_params['z_threshold']}")
+    print(f"  3. Z-score平仓阈值: {default_params['z_exit_threshold']}")
+    print(f"  4. 止盈百分比: {default_params['take_profit_pct'] * 100:.1f}%")
+    print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
+    print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
+    print(
+        f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1 - default_params['position_ratio']) * 100:.1f}%作为安全垫)")
+    print(f"  8. 杠杆: {default_params['leverage']}倍")
+    print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
+    print(f"  10. 近月到期前禁开仓: {default_params['expiry_no_entry_days']}天")
+    print(f"  11. 近月到期前强制平仓: {default_params['expiry_force_close_days']}天")
+
+    print("\n是否要修改参数？")
+    print("输入 'y' 修改参数，直接回车使用默认参数")
+
+    modify_choice = input("请选择: ").strip().lower()
+
+    if modify_choice == 'y':
+        print("\n请输入新的参数值（直接回车保持默认值）:")
+
+        # 回看期
+        lookback_input = input(f"回看期 (默认: {default_params['lookback_period']}): ").strip()
+        if lookback_input:
+            try:
+                default_params['lookback_period'] = int(lookback_input)
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['lookback_period']}")
+
+        # Z-score开仓阈值
+        z_threshold_input = input(f"Z-score开仓阈值 (默认: {default_params['z_threshold']}): ").strip()
+        if z_threshold_input:
+            try:
+                default_params['z_threshold'] = float(z_threshold_input)
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['z_threshold']}")
+
+        # Z-score平仓阈值
+        z_exit_input = input(f"Z-score平仓阈值 (默认: {default_params['z_exit_threshold']}): ").strip()
+        if z_exit_input:
+            try:
+                default_params['z_exit_threshold'] = float(z_exit_input)
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['z_exit_threshold']}")
+
+        # 止盈百分比
+        take_profit_input = input(f"止盈百分比 (默认: {default_params['take_profit_pct'] * 100:.1f}%): ").strip()
+        if take_profit_input:
+            try:
+                default_params['take_profit_pct'] = float(take_profit_input) / 100
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['take_profit_pct'] * 100:.1f}%")
+
+        # 止损百分比
+        stop_loss_input = input(f"止损百分比 (默认: {default_params['stop_loss_pct'] * 100:.1f}%): ").strip()
+        if stop_loss_input:
+            try:
+                default_params['stop_loss_pct'] = float(stop_loss_input) / 100
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['stop_loss_pct'] * 100:.1f}%")
+
+        # 最大持仓时间
+        max_holding_input = input(f"最大持仓时间(小时) (默认: {default_params['max_holding_hours']}): ").strip()
+        if max_holding_input:
+            try:
+                default_params['max_holding_hours'] = int(max_holding_input)
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['max_holding_hours']}")
+
+        # 仓位比例
+        position_ratio_input = input(f"仓位比例 (默认: {default_params['position_ratio'] * 100:.1f}%): ").strip()
+        if position_ratio_input:
+            try:
+                default_params['position_ratio'] = float(position_ratio_input) / 100
+                if default_params['position_ratio'] <= 0 or default_params['position_ratio'] > 1:
+                    print(f"仓位比例应在0-100%之间，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
+                    default_params['position_ratio'] = 0.5
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['position_ratio'] * 100:.1f}%")
+
+        # 杠杆
+        leverage_input = input(f"杠杆 (默认: {default_params['leverage']}): ").strip()
+        if leverage_input:
+            try:
+                default_params['leverage'] = int(leverage_input)
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['leverage']}")
+
+        # 交易手续费率
+        fee_rate_input = input(f"交易手续费率 (默认: {default_params['trading_fee_rate'] * 100:.4f}%): ").strip()
+        if fee_rate_input:
+            try:
+                default_params['trading_fee_rate'] = float(fee_rate_input) / 100
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['trading_fee_rate'] * 100:.4f}%")
+
+        no_entry_input = input(
+            f"近月到期前禁开仓天数 (默认: {default_params['expiry_no_entry_days']}): "
+        ).strip()
+        if no_entry_input:
+            try:
+                default_params['expiry_no_entry_days'] = max(0, int(no_entry_input))
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['expiry_no_entry_days']}")
+
+        force_close_input = input(
+            f"近月到期前强制平仓天数 (默认: {default_params['expiry_force_close_days']}): "
+        ).strip()
+        if force_close_input:
+            try:
+                default_params['expiry_force_close_days'] = max(0, int(force_close_input))
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_params['expiry_force_close_days']}")
+
+        print("\n修改后的参数:")
+        print(f"  1. 回看期: {default_params['lookback_period']}")
+        print(f"  2. Z-score开仓阈值: {default_params['z_threshold']}")
+        print(f"  3. Z-score平仓阈值: {default_params['z_exit_threshold']}")
+        print(f"  4. 止盈百分比: {default_params['take_profit_pct'] * 100:.1f}%")
+        print(f"  5. 止损百分比: {default_params['stop_loss_pct'] * 100:.1f}%")
+        print(f"  6. 最大持仓时间: {default_params['max_holding_hours']}小时")
+        print(
+            f"  7. 仓位比例: {default_params['position_ratio'] * 100:.1f}% (留{(1 - default_params['position_ratio']) * 100:.1f}%作为安全垫)")
+        print(f"  8. 杠杆: {default_params['leverage']}倍")
+        print(f"  9. 交易手续费率: {default_params['trading_fee_rate'] * 100:.4f}%")
+        print(f"  10. 近月到期前禁开仓: {default_params['expiry_no_entry_days']}天")
+        print(f"  11. 近月到期前强制平仓: {default_params['expiry_force_close_days']}天")
+
+    return default_params
+
+
+def kline_interval_to_minutes(interval: str) -> float:
+    """将 Binance K 线周期字符串转为分钟数。"""
+    mapping = {
+        '1m': 1.0, '5m': 5.0, '15m': 15.0, '30m': 30.0,
+        '1h': 60.0, '4h': 240.0, '1d': 1440.0,
+    }
+    return mapping.get(interval, 60.0)
+
+
+def input_periodic_cointegration_params(avg_period_minutes, default_window_size=500, default_days=10):
+    """
+    配置定期协整参数：滚动窗口、重算间隔、beta 变化率上限
+
+    Args:
+        avg_period_minutes: K线周期（分钟）
+        default_window_size: 默认滚动窗口（根K线）
+        default_days: 默认重算间隔（天），用于换算默认K线根数
+
+    Returns:
+        dict
+    """
+    default_interval = max(1, int(default_days * 24 * 60 / avg_period_minutes))
+    default_days_actual = default_interval * avg_period_minutes / 60 / 24
+
+    print("\n" + "=" * 60)
+    print("配置定期协整参数")
+    print("=" * 60)
+    print("以下参数用于：滚动窗口 OLS 估计对冲比率 + ADF 协整检验 + 定期重算触发间隔。")
+    print(f"当前 K 线周期: {avg_period_minutes:.0f} 分钟/根")
+
+    cointegration_window_size = default_window_size
+    while True:
+        user_input = input(
+            f"\n定期协整滚动窗口大小-根K线 (默认{default_window_size}): "
+        ).strip()
+        if not user_input:
+            break
+        try:
+            window_size = int(user_input)
+            if window_size <= 0:
+                print("窗口大小必须为正整数，请重新输入。")
+                continue
+            cointegration_window_size = window_size
+            break
+        except ValueError:
+            print("输入无效，请输入正整数。")
+
+    cointegration_check_interval = default_interval
+    while True:
+        user_input = input(
+            f"\n定期协整重算间隔-根K线 (默认{default_interval}，约{default_days_actual:.1f}天): "
+        ).strip()
+        if not user_input:
+            break
+        try:
+            interval = int(user_input)
+            if interval <= 0:
+                print("间隔必须为正整数，请重新输入。")
+                continue
+            cointegration_check_interval = interval
+            break
+        except ValueError:
+            print("输入无效，请输入正整数。")
+
+    hedge_ratio_max_change_rate = 0.2
+    change_input = input("\n对冲比率最大单次变化率 (默认0.2): ").strip()
+    if change_input:
+        try:
+            hedge_ratio_max_change_rate = float(change_input)
+            if hedge_ratio_max_change_rate <= 0:
+                hedge_ratio_max_change_rate = 0.2
+        except ValueError:
+            hedge_ratio_max_change_rate = 0.2
+
+    interval_days = cointegration_check_interval * avg_period_minutes / 60 / 24
+    print(f"\n已配置:")
+    print(f"  定期协整滚动窗口: {cointegration_window_size} 根K线")
+    print(f"  定期协整重算间隔: {cointegration_check_interval} 根K线 (约{interval_days:.1f}天)")
+    print(f"  对冲比率最大变化率: {hedge_ratio_max_change_rate}")
+
+    return {
+        'cointegration_window_size': cointegration_window_size,
+        'cointegration_check_interval': cointegration_check_interval,
+        'hedge_ratio_max_change_rate': hedge_ratio_max_change_rate,
+    }
+
+
+def configure_hedge_ratio_update_mode():
+    """选择对冲比率更新方式（窗口/间隔由 input_periodic_cointegration_params 单独配置）。"""
+    print("\n配置对冲比率更新方式")
+    print("  1. 定期协整重算（推荐）：滚动窗口 OLS + ADF，通过时更新 beta")
+    print("  2. RLS 递推更新（实验性，长期运行有 P 矩阵数值风险）")
+    print("  3. 静态对冲比率：使用输入时的 beta，不再更新")
+    hedge_mode = input("请选择 (1/2/3，默认1): ").strip()
+
+    if hedge_mode == '2':
+        use_periodic_recalc = False
+        use_rls = True
+    elif hedge_mode == '3':
+        use_periodic_recalc = False
+        use_rls = False
+    else:
+        use_periodic_recalc = True
+        use_rls = False
+
+    rls_lambda = 0.99
+    if use_rls:
+        rls_lambda_input = input("RLS遗忘因子 (默认0.99): ").strip()
+        if rls_lambda_input:
+            try:
+                rls_lambda = float(rls_lambda_input)
+                if rls_lambda <= 0 or rls_lambda > 1:
+                    rls_lambda = 0.99
+            except ValueError:
+                rls_lambda = 0.99
+        print("  注意: RLS 模式下仍会做定期协整检验，但 beta 由 RLS 逐 K 线更新")
+
+    return {
+        'use_periodic_recalc': use_periodic_recalc,
+        'use_rls': use_rls,
+        'rls_lambda': rls_lambda,
+    }
+
+
+def build_hedge_params(mode_params, periodic_params=None, avg_period_minutes=60.0):
+    """合并模式选择与定期协整参数。"""
+    hedge_params = dict(mode_params)
+    if hedge_params['use_periodic_recalc'] or hedge_params['use_rls']:
+        if periodic_params is None:
+            default_interval = max(1, int(10 * 24 * 60 / avg_period_minutes))
+            periodic_params = {
+                'cointegration_window_size': 500,
+                'cointegration_check_interval': default_interval,
+                'hedge_ratio_max_change_rate': 0.2,
+            }
+        hedge_params.update(periodic_params)
+    else:
+        hedge_params['cointegration_window_size'] = 500
+        hedge_params['cointegration_check_interval'] = max(1, int(10 * 24 * 60 / avg_period_minutes))
+        hedge_params['hedge_ratio_max_change_rate'] = 0.2
+    return hedge_params
+
+
+# ==================== 预热数据参数配置 ====================
+
+def configure_warmup_parameters(lookback_period):
+    """配置预热数据参数"""
+    print("\n" + "=" * 80)
+    print("预热数据参数配置")
+    print("=" * 80)
+
+    # 默认参数
+    default_warmup_params = {
+        'lookback_period': lookback_period,
+        'interval': '1h',  # K线周期
+        'warmup_safety_margin': 10  # 安全余量（数据点数量）
+    }
+
+    print("当前默认参数:")
+    print(f"  回看期: {default_warmup_params['lookback_period']} (从交易参数中获取)")
+    print(f"  K线周期: {default_warmup_params['interval']}")
+    print(f"  安全余量: {default_warmup_params['warmup_safety_margin']} 个数据点")
+    print(
+        f"  预热期总长度: {default_warmup_params['lookback_period'] + default_warmup_params['warmup_safety_margin']} 个数据点")
+
+    print("\n是否要修改预热数据参数？")
+    print("输入 'y' 修改参数，直接回车使用默认参数")
+
+    modify_choice = input("请选择: ").strip().lower()
+
+    if modify_choice == 'y':
+        print("\n请输入新的参数值（直接回车保持默认值）:")
+
+        # K线周期
+        print("\n可选K线周期:")
+        print("  1m - 1分钟")
+        print("  5m - 5分钟")
+        print("  15m - 15分钟")
+        print("  30m - 30分钟")
+        print("  1h - 1小时")
+        print("  4h - 4小时")
+        print("  1d - 1天")
+
+        interval_input = input(f"K线周期 (默认: {default_warmup_params['interval']}): ").strip().lower()
+        if interval_input:
+            valid_intervals = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
+            if interval_input in valid_intervals:
+                default_warmup_params['interval'] = interval_input
+            else:
+                print(f"无效的周期，使用默认值: {default_warmup_params['interval']}")
+
+        # 安全余量
+        safety_margin_input = input(
+            f"安全余量（数据点数量，默认: {default_warmup_params['warmup_safety_margin']}）: ").strip()
+        if safety_margin_input:
+            try:
+                default_warmup_params['warmup_safety_margin'] = int(safety_margin_input)
+                if default_warmup_params['warmup_safety_margin'] < 0:
+                    print("安全余量不能为负数，使用默认值")
+                    default_warmup_params['warmup_safety_margin'] = 10
+            except ValueError:
+                print(f"输入无效，使用默认值: {default_warmup_params['warmup_safety_margin']}")
+
+        # 更新回看期（从交易参数中获取，但允许用户确认）
+        print(f"\n回看期: {default_warmup_params['lookback_period']} (与交易参数一致)")
+        lookback_confirm = input("是否要修改回看期？(y/n，默认n): ").strip().lower()
+        if lookback_confirm == 'y':
+            lookback_input = input(f"回看期 (当前: {default_warmup_params['lookback_period']}): ").strip()
+            if lookback_input:
+                try:
+                    default_warmup_params['lookback_period'] = int(lookback_input)
+                except ValueError:
+                    print(f"输入无效，保持当前值: {default_warmup_params['lookback_period']}")
+
+        print("\n修改后的参数:")
+        print(f"  回看期: {default_warmup_params['lookback_period']}")
+        print(f"  K线周期: {default_warmup_params['interval']}")
+        print(f"  安全余量: {default_warmup_params['warmup_safety_margin']} 个数据点")
+        print(
+            f"  预热期总长度: {default_warmup_params['lookback_period'] + default_warmup_params['warmup_safety_margin']} 个数据点")
+
+    return default_warmup_params
+
+
+# ==================== 实盘交易主函数 ====================
+
+def test_live_trading():
+    """实盘交易测试主函数"""
+    print("=" * 80)
+    print("实盘协整交易系统（支持ARIMA-GARCH）")
+    print("=" * 80)
+
+    # 1. 选择Z-score策略
+    z_score_strategy = select_z_score_strategy()
+    if z_score_strategy is None:
+        print("未选择策略，退出程序")
+        return
+
+    # 2. 初始化币安API
+    print("\n1. 初始化币安API")
+    binance_api = BinanceAPI()
+
+    # 3. 获取币对配置
+    print("\n2. 获取币对配置")
+    pairs_config = get_pairs_config()
+
+    if not pairs_config:
+        print("未配置任何币对，无法进行交易")
+        return
+
+    # 4. 配置交易参数
+    print("\n3. 配置交易参数")
+    trading_params = configure_trading_parameters()
+
+    # 5. 配置预热数据参数
+    print("\n4. 配置预热数据参数")
+    warmup_params = configure_warmup_parameters(trading_params['lookback_period'])
+
+    # 6. 初始化数据管理器
+    print("\n5. 初始化数据管理器")
+    symbols = []
+    for pair in pairs_config:
+        symbols.extend([pair['symbol1'], pair['symbol2']])
+    symbols = list(set(symbols))  # 去重
+
+    data_manager = RealTimeDataManager(binance_api)
+
+    # 7. 收集预热数据
+    print("\n6. 收集预热数据")
+    warmup_period = warmup_params['lookback_period'] + warmup_params['warmup_safety_margin']
+    warmup_data = data_manager.collect_warmup_data(
+        symbols,
+        interval=warmup_params['interval'],
+        warmup_period=warmup_period
+    )
+
+    # 将预热数据加载到数据缓存
+    data_manager.data_cache = warmup_data
+
+    # 8. 启动实时数据收集
+    print("\n7. 启动实时数据收集")
+    data_manager.start_data_collection(symbols, interval=warmup_params['interval'])
+
+    # 9. 配置对冲比率更新方式与定期协整参数
+    print("\n8. 配置对冲比率更新方式")
+    kline_minutes = kline_interval_to_minutes(warmup_params['interval'])
+    mode_params = configure_hedge_ratio_update_mode()
+    periodic_params = None
+    if mode_params['use_periodic_recalc'] or mode_params['use_rls']:
+        periodic_params = input_periodic_cointegration_params(kline_minutes)
+    hedge_params = build_hedge_params(mode_params, periodic_params, kline_minutes)
+
+    use_periodic_recalc = hedge_params['use_periodic_recalc']
+    use_rls = hedge_params['use_rls']
+    rls_lambda = hedge_params['rls_lambda']
+    cointegration_window_size = hedge_params['cointegration_window_size']
+    cointegration_check_interval = hedge_params['cointegration_check_interval']
+    hedge_ratio_max_change_rate = hedge_params['hedge_ratio_max_change_rate']
+
+    # 10. 初始化交易策略
+    print("\n9. 初始化交易策略")
+    # 获取价差类型（从第一个币对获取，假设所有币对使用相同的价差类型）
+    diff_order = pairs_config[0].get('diff_order', 0) if pairs_config else 0
+    trading_strategy = AdvancedCointegrationTrading(
+        binance_api=binance_api,
+        lookback_period=trading_params['lookback_period'],
+        z_threshold=trading_params['z_threshold'],
+        z_exit_threshold=trading_params['z_exit_threshold'],
+        take_profit_pct=trading_params['take_profit_pct'],
+        stop_loss_pct=trading_params['stop_loss_pct'],
+        max_holding_hours=trading_params['max_holding_hours'],
+        position_ratio=trading_params['position_ratio'],
+        leverage=trading_params['leverage'],
+        trading_fee_rate=trading_params['trading_fee_rate'],
+        z_score_strategy=z_score_strategy,
+        use_periodic_recalc=use_periodic_recalc,
+        use_rls=use_rls,
+        rls_lambda=rls_lambda,
+        hedge_ratio_max_change_rate=hedge_ratio_max_change_rate,
+        cointegration_window_size=cointegration_window_size,
+        cointegration_check_interval=cointegration_check_interval,
+        diff_order=diff_order,
+        expiry_no_entry_days=trading_params.get('expiry_no_entry_days', 7),
+        expiry_force_close_days=trading_params.get('expiry_force_close_days', 3),
+        settlement_asset=parse_coin_m_base(pairs_config[0]['symbol1']) if pairs_config else None,
+    )
+
+    # 初始化对冲比率（定期重算或 RLS）
+    if use_periodic_recalc:
+        print("\n初始化定期协整重算...")
+        for pair_info in pairs_config:
+            symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+            pair_key = f"{symbol1}_{symbol2}"
+
+            if symbol1 not in warmup_data or symbol2 not in warmup_data:
+                print(f"  警告: {pair_key} 预热数据不足，无法初始化")
+                continue
+
+            init_price1 = warmup_data[symbol1]
+            init_price2 = warmup_data[symbol2]
+            try:
+                trading_strategy.initialize_periodic_hedge_for_pair(
+                    pair_key, init_price1, init_price2, symbol1, symbol2, pair_info
+                )
+            except Exception as e:
+                print(f"  警告: {pair_key} 定期重算初始化失败: {str(e)}")
+    elif use_rls:
+        print("\n初始化RLS...")
+        for pair_info in pairs_config:
+            symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+            pair_key = f"{symbol1}_{symbol2}"
+
+            if symbol1 not in warmup_data or symbol2 not in warmup_data:
+                print(f"  警告: {pair_key} 预热数据不足，无法初始化RLS")
+                continue
+
+            # 更新
+            # 使用预热数据初始化RLS
+            init_price1 = warmup_data[symbol1]
+            init_price2 = warmup_data[symbol2]
+
+            if len(init_price1) < 30 or len(init_price2) < 30:
+                print(f"  警告: {pair_key} 数据不足（需要至少30个数据点），无法初始化RLS")
+                continue
+
+            trading_strategy.initialize_rls_for_pair(pair_key, init_price1, init_price2)
+
+    print(f"\n策略参数:")
+    print(f"  回看期: {trading_params['lookback_period']}")
+    print(f"  Z-score开仓阈值: {trading_params['z_threshold']}")
+    print(f"  Z-score平仓阈值: {trading_params['z_exit_threshold']}")
+    print(f"  止盈百分比: {trading_params['take_profit_pct'] * 100:.1f}%")
+    print(f"  止损百分比: {trading_params['stop_loss_pct'] * 100:.1f}%")
+    print(f"  最大持仓时间: {trading_params['max_holding_hours']}小时")
+    print(f"  近月到期前禁开仓: {trading_params.get('expiry_no_entry_days', 7)}天")
+    print(f"  近月到期前强制平仓: {trading_params.get('expiry_force_close_days', 3)}天")
+    print(f"  仓位比例: {trading_params['position_ratio'] * 100:.1f}%")
+    print(f"  杠杆: {trading_params['leverage']}倍")
+    print(f"  Z-score策略: {z_score_strategy.get_strategy_description()}")
+    if use_periodic_recalc:
+        print(f"  对冲比率模式: 定期协整重算（推荐）")
+        print(f"  协整滚动窗口: {cointegration_window_size} 根K线")
+        print(f"  协整重算间隔: {cointegration_check_interval} 根K线")
+        print(f"  对冲比率最大变化率: {hedge_ratio_max_change_rate}")
+    elif use_rls:
+        print(f"  对冲比率模式: RLS递推（实验性）")
+        print(f"  RLS遗忘因子: {rls_lambda}")
+        print(f"  对冲比率最大变化率: {hedge_ratio_max_change_rate}")
+        print(f"  协整滚动窗口: {cointegration_window_size} 根K线")
+        print(f"  协整重算间隔: {cointegration_check_interval} 根K线")
+    else:
+        print(f"  对冲比率模式: 静态（启动后不变）")
+    print(f"  K线周期: {warmup_params['interval']}")
+
+    # 12. 启动Web服务器
+    print("\n11. 启动Web服务器")
+    server = LiveTradingServer(trading_strategy)
+
+    # 13. 启动交易循环
+    print("\n12. 启动交易循环")
+    trading_strategy.running = True
+
+    # 获取预热数据中的最后一个K线时间戳，作为基准时间戳
+    # 只有在这个时间戳之后的新K线才会被认为是"新K线"并触发交易
+    initial_kline_timestamp = data_manager.get_latest_closed_kline_timestamp()
+    if initial_kline_timestamp:
+        print(f"实盘开始时间基准: {initial_kline_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  预热数据中的最后一个K线时间戳，此时间之前的K线不会触发交易")
+    else:
+        print("警告: 无法获取初始K线时间戳")
+
+    def trading_loop():
+        """交易循环（只在K线收盘时执行交易决策）"""
+        last_spread_output = 0
+        last_position_sync = 0
+        # 初始化为预热数据中的最后一个K线时间戳，避免对历史数据执行交易
+        last_processed_kline_timestamp = initial_kline_timestamp
+
+        while trading_strategy.running:
+            try:
+                # 优先处理单边平仓失败的恢复（不依赖K线，每轮都检查）
+                trading_strategy.process_pending_recovery_close()
+
+                current_data = data_manager.get_current_data()
+                current_prices = data_manager.get_current_prices() or {}
+                trading_strategy.remember_prices(current_prices)
+
+                latest_kline_timestamp = data_manager.get_latest_closed_kline_timestamp()
+                has_new_kline = (latest_kline_timestamp is not None and
+                                 latest_kline_timestamp != last_processed_kline_timestamp)
+                kline_close_prices = data_manager.get_latest_closed_kline_prices() or {}
+                trading_strategy.remember_prices(kline_close_prices)
+
+                now_ts = datetime.now()
+                for pair_info in pairs_config:
+                    live_px = current_prices if current_prices else kline_close_prices
+                    trading_strategy.try_expiry_or_missing_flatten(
+                        pair_info, live_px, now_ts
+                    )
+
+                if not current_data:
+                    time.sleep(10)
+                    continue
+
+                # 每10秒输出一次价差数据
+                current_time = time.time()
+                if current_time - last_spread_output >= 10:
+                    print(f"\n{'=' * 60}")
+                    print(f"价差监控 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"{'=' * 60}")
+
+                    for pair_info in pairs_config:
+                        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+                        pair_key = f"{symbol1}_{symbol2}"
+
+                        if symbol1 not in current_prices or symbol2 not in current_prices:
+                            continue
+
+                        if symbol1 not in current_data or symbol2 not in current_data:
+                            continue
+
+                        # 监控展示：只读取当前对冲比率，不触发 RLS 更新或协整计数
+                        current_hedge_ratio = trading_strategy.get_hedge_ratio_for_pair(
+                            pair_key, pair_info
+                        )
+
+                        # 计算价差和Z-score（根据diff_order选择计算方式）
+                        diff_order = pair_info.get('diff_order', 0)
+                        data1 = current_data[symbol1]
+                        data2 = current_data[symbol2]
+
+                        if diff_order == 0:
+                            # 原始价差
+                            current_spread = trading_strategy.calculate_current_spread(
+                                current_prices[symbol1],
+                                current_prices[symbol2],
+                                current_hedge_ratio
+                            )
+
+                            # 获取历史价差数据
+                            historical_spreads = []
+                            historical_prices1 = []
+                            historical_prices2 = []
+                            for i in range(max(0, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                if i < len(data2):
+                                    # 如果使用RLS，尝试获取历史对冲比率
+                                    hist_hedge_ratio = current_hedge_ratio
+                                    if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
+                                        rls = trading_strategy.rls_instances[pair_key]
+                                        if len(rls.beta_history) > (len(data1) - i):
+                                            hist_hedge_ratio = rls.beta_history[-(len(data1) - i)][1]
+
+                                    hist_spread = trading_strategy.calculate_current_spread(
+                                        data1.iloc[i], data2.iloc[i], hist_hedge_ratio
+                                    )
+                                    historical_spreads.append(hist_spread)
+                                    historical_prices1.append(data1.iloc[i])
+                                    historical_prices2.append(data2.iloc[i])
+                        elif diff_order == 1:
+                            # 一阶差分价差
+                            if len(data1) > 1 and len(data2) > 1:
+                                # 当前一阶差分：当前价格 - 前一个价格
+                                current_diff1 = current_prices[symbol1] - data1.iloc[-1]
+                                current_diff2 = current_prices[symbol2] - data2.iloc[-1]
+                                # 一阶差分价差 = diff1 - hedge_ratio * diff2
+                                # 注意：hedge_ratio应该从一阶差分价格计算得出
+                                current_spread = current_diff1 - pair_info['hedge_ratio'] * current_diff2
+
+                                # 获取历史一阶差分价差数据
+                                historical_spreads = []
+                                for i in range(max(1, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                    if i < len(data2) and i > 0:
+                                        hist_diff1 = data1.iloc[i] - data1.iloc[i - 1]
+                                        hist_diff2 = data2.iloc[i] - data2.iloc[i - 1]
+                                        hist_spread = hist_diff1 - pair_info['hedge_ratio'] * hist_diff2
+                                        historical_spreads.append(hist_spread)
+                            else:
+                                current_spread = 0
+                                historical_spreads = []
+                        elif diff_order == 2:
+                            # 二阶差分价差
+                            if len(data1) > 2 and len(data2) > 2:
+                                # 当前二阶差分：price[t] - 2*price[t-1] + price[t-2]
+                                current_diff1 = (current_prices[symbol1] -
+                                                 2 * data1.iloc[-1] +
+                                                 data1.iloc[-2])
+                                current_diff2 = (current_prices[symbol2] -
+                                                 2 * data2.iloc[-1] +
+                                                 data2.iloc[-2])
+                                # 二阶差分价差 = diff2_1 - hedge_ratio * diff2_2
+                                # 注意：hedge_ratio应该从二阶差分价格计算得出
+                                current_spread = current_diff1 - pair_info['hedge_ratio'] * current_diff2
+
+                                # 获取历史二阶差分价差数据
+                                historical_spreads = []
+                                for i in range(max(2, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                    if i < len(data2) and i > 1:
+                                        hist_diff1 = (data1.iloc[i] -
+                                                      2 * data1.iloc[i - 1] +
+                                                      data1.iloc[i - 2])
+                                        hist_diff2 = (data2.iloc[i] -
+                                                      2 * data2.iloc[i - 1] +
+                                                      data2.iloc[i - 2])
+                                        hist_spread = hist_diff1 - pair_info['hedge_ratio'] * hist_diff2
+                                        historical_spreads.append(hist_spread)
+                            else:
+                                current_spread = 0
+                                historical_spreads = []
+                        else:
+                            # 不支持其他差分阶数，使用原始价差
+                            current_spread = trading_strategy.calculate_current_spread(
+                                current_prices[symbol1],
+                                current_prices[symbol2],
+                                current_hedge_ratio
+                            )
+                            historical_spreads = []
+                            historical_prices1 = []
+                            historical_prices2 = []
+
+                        current_z_score = trading_strategy.calculate_z_score(
+                            current_spread,
+                            historical_spreads,
+                            historical_prices1=historical_prices1 if historical_prices1 else None,
+                            historical_prices2=historical_prices2 if historical_prices2 else None
+                        )
+
+                        # 输出价差信息
+                        diff_type = '原始价差' if diff_order == 0 else f"{diff_order}阶差分价差"
+                        print(f"币对: {pair_info['pair_name']} ({diff_type})")
+                        print(
+                            f"  价格: {symbol1}={current_prices[symbol1]:.4f}, {symbol2}={current_prices[symbol2]:.4f}")
+                        print(f"  当前价差: {current_spread:.8f}")
+                        print(f"  对冲比率 beta: {current_hedge_ratio:.6f}")
+                        print(f"  Z-score: {current_z_score:.4f}")
+
+                        # 显示交易信号
+                        signal = trading_strategy.generate_trading_signal(current_z_score)
+                        signal_color = "🟢" if signal['action'] == 'HOLD' else "🔴"
+                        print(f"  交易信号: {signal_color} {signal['description']}")
+
+                        # 显示持仓状态
+                        if pair_info['pair_name'] in trading_strategy.positions:
+                            position = trading_strategy.positions[pair_info['pair_name']]
+                            holding_hours = (datetime.now() - position['entry_time']).total_seconds() / 3600
+                            print(f"  持仓状态: 🔵 已持仓 {holding_hours:.1f} 小时")
+                        else:
+                            print(f"  持仓状态: ⚪ 无持仓")
+                        days_left, expiry_d = trading_strategy.expiry_days_left(pair_info, datetime.now())
+                        if expiry_d is not None:
+                            print(f"  近月交割: {expiry_d}（剩余 {days_left} 天）")
+
+                        print()
+
+                    last_spread_output = current_time
+
+                # 只在有新K线收盘时执行交易逻辑（与回测保持一致）
+                if has_new_kline and kline_close_prices:
+                    print(f"\n{'=' * 60}")
+                    print(f"K线收盘 - {latest_kline_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"{'=' * 60}")
+
+                    # 检查每个币对（交易逻辑）
+                    for pair_info in pairs_config:
+                        symbol1, symbol2 = pair_info['symbol1'], pair_info['symbol2']
+                        pair_key = f"{symbol1}_{symbol2}"
+
+                        if trading_strategy.try_expiry_or_missing_flatten(
+                                pair_info, kline_close_prices, latest_kline_timestamp
+                        ):
+                            continue
+
+                        if symbol1 not in kline_close_prices or symbol2 not in kline_close_prices:
+                            continue
+
+                        if symbol1 not in current_data or symbol2 not in current_data:
+                            continue
+
+                        # 使用K线收盘价（与回测保持一致）
+                        close_price1 = kline_close_prices[symbol1]
+                        close_price2 = kline_close_prices[symbol2]
+
+                        # 每根已收盘 K 线：更新对冲比率 / 触发定期协整重算
+                        if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
+                            current_hedge_ratio = trading_strategy.update_rls_for_pair(
+                                pair_key, close_price1, close_price2
+                            )
+                            if current_hedge_ratio is None:
+                                current_hedge_ratio = trading_strategy.get_hedge_ratio_for_pair(
+                                    pair_key, pair_info
+                                )
+                        else:
+                            current_hedge_ratio = trading_strategy.get_hedge_ratio_for_pair(
+                                pair_key, pair_info
+                            )
+
+                        if trading_strategy.use_periodic_recalc or trading_strategy.use_rls:
+                            if pair_key not in trading_strategy.data_point_count:
+                                trading_strategy.data_point_count[pair_key] = 0
+                            trading_strategy.data_point_count[pair_key] += 1
+
+                            if pair_key in trading_strategy.cointegration_status:
+                                data1 = current_data[symbol1]
+                                data2 = current_data[symbol2]
+
+                                coint_check_result = trading_strategy.check_cointegration_periodically(
+                                    pair_key, data1, data2, symbol1, symbol2
+                                )
+
+                            if not trading_strategy.is_cointegration_trading_allowed(pair_key):
+                                trade = trading_strategy.force_close_on_cointegration_failure(
+                                    pair_info, kline_close_prices, latest_kline_timestamp, current_hedge_ratio
+                                )
+                                if trade:
+                                    print(f"   强制平仓完成")
+                                continue
+
+                            if trading_strategy.use_periodic_recalc:
+                                current_hedge_ratio = trading_strategy.get_hedge_ratio_for_pair(
+                                    pair_key, pair_info
+                                )
+                                pair_info['hedge_ratio'] = current_hedge_ratio
+
+                        # 计算价差和Z-score（根据diff_order选择计算方式，使用K线收盘价）
+                        diff_order = pair_info.get('diff_order', 0)
+                        data1 = current_data[symbol1]
+                        data2 = current_data[symbol2]
+
+                        if diff_order == 0:
+                            # 原始价差（使用K线收盘价）
+                            current_spread = trading_strategy.calculate_current_spread(
+                                close_price1,
+                                close_price2,
+                                current_hedge_ratio
+                            )
+
+                            # 获取历史价差数据
+                            historical_spreads = []
+                            historical_prices1 = []
+                            historical_prices2 = []
+                            for i in range(max(0, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                if i < len(data2):
+                                    # 如果使用RLS，尝试获取历史对冲比率
+                                    hist_hedge_ratio = current_hedge_ratio
+                                    if trading_strategy.use_rls and pair_key in trading_strategy.rls_instances:
+                                        rls = trading_strategy.rls_instances[pair_key]
+                                        if len(rls.beta_history) > (len(data1) - i):
+                                            hist_hedge_ratio = rls.beta_history[-(len(data1) - i)][1]
+
+                                    hist_spread = trading_strategy.calculate_current_spread(
+                                        data1.iloc[i], data2.iloc[i], hist_hedge_ratio
+                                    )
+                                    historical_spreads.append(hist_spread)
+                                    historical_prices1.append(data1.iloc[i])
+                                    historical_prices2.append(data2.iloc[i])
+                        elif diff_order == 1:
+                            # 一阶差分价差（使用K线收盘价）
+                            if len(data1) > 1 and len(data2) > 1:
+                                # 当前一阶差分：当前K线收盘价 - 前一个K线收盘价
+                                current_diff1 = close_price1 - data1.iloc[-1]
+                                current_diff2 = close_price2 - data2.iloc[-1]
+                                # 一阶差分价差 = diff1 - hedge_ratio * diff2
+                                # 注意：hedge_ratio应该从一阶差分价格计算得出
+                                current_spread = current_diff1 - current_hedge_ratio * current_diff2
+
+                                # 获取历史一阶差分价差数据
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                                for i in range(max(1, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                    if i < len(data2) and i > 0:
+                                        hist_diff1 = data1.iloc[i] - data1.iloc[i - 1]
+                                        hist_diff2 = data2.iloc[i] - data2.iloc[i - 1]
+                                        hist_spread = hist_diff1 - current_hedge_ratio * hist_diff2
+                                        historical_spreads.append(hist_spread)
+                                        historical_prices1.append(data1.iloc[i])
+                                        historical_prices2.append(data2.iloc[i])
+                            else:
+                                current_spread = 0
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                        elif diff_order == 2:
+                            # 二阶差分价差（使用K线收盘价）
+                            if len(data1) > 2 and len(data2) > 2:
+                                # 当前二阶差分：price[t] - 2*price[t-1] + price[t-2]
+                                current_diff1 = (close_price1 -
+                                                 2 * data1.iloc[-1] +
+                                                 data1.iloc[-2])
+                                current_diff2 = (close_price2 -
+                                                 2 * data2.iloc[-1] +
+                                                 data2.iloc[-2])
+                                # 二阶差分价差 = diff2_1 - hedge_ratio * diff2_2
+                                # 注意：hedge_ratio应该从二阶差分价格计算得出
+                                current_spread = current_diff1 - current_hedge_ratio * current_diff2
+
+                                # 获取历史二阶差分价差数据
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                                for i in range(max(2, len(data1) - trading_strategy.lookback_period), len(data1)):
+                                    if i < len(data2) and i > 1:
+                                        hist_diff1 = (data1.iloc[i] -
+                                                      2 * data1.iloc[i - 1] +
+                                                      data1.iloc[i - 2])
+                                        hist_diff2 = (data2.iloc[i] -
+                                                      2 * data2.iloc[i - 1] +
+                                                      data2.iloc[i - 2])
+                                        hist_spread = hist_diff1 - current_hedge_ratio * hist_diff2
+                                        historical_spreads.append(hist_spread)
+                                        historical_prices1.append(data1.iloc[i])
+                                        historical_prices2.append(data2.iloc[i])
+                            else:
+                                current_spread = 0
+                                historical_spreads = []
+                                historical_prices1 = []
+                                historical_prices2 = []
+                        else:
+                            # 不支持其他差分阶数，使用原始价差（使用K线收盘价）
+                            current_spread = trading_strategy.calculate_current_spread(
+                                close_price1,
+                                close_price2,
+                                current_hedge_ratio
+                            )
+                            historical_spreads = []
+                            historical_prices1 = []
+                            historical_prices2 = []
+
+                        current_z_score = trading_strategy.calculate_z_score(
+                            current_spread,
+                            historical_spreads,
+                            historical_prices1=historical_prices1 if historical_prices1 else None,
+                            historical_prices2=historical_prices2 if historical_prices2 else None
+                        )
+
+                        print(f"币对: {pair_info['pair_name']}")
+                        print(f"  K线收盘价: {symbol1}={close_price1:.4f}, {symbol2}={close_price2:.4f}")
+                        print(f"  当前价差: {current_spread:.8f}")
+                        print(f"  Z-score: {current_z_score:.4f}")
+
+                        # 检查平仓条件（使用K线收盘价）
+                        if pair_info['pair_name'] in trading_strategy.positions:
+                            should_close, close_reason = trading_strategy.check_exit_conditions(
+                                pair_info, kline_close_prices, current_z_score, latest_kline_timestamp, current_spread
+                            )
+
+                            if should_close:
+                                trading_strategy.close_position(pair_info, kline_close_prices, close_reason,
+                                                                latest_kline_timestamp,
+                                                                current_spread)
+                                print(f"   平仓: {close_reason}")
+
+                        # 检查开仓条件（使用K线收盘价，且无待恢复平仓时方可开仓）
+                        elif (len(trading_strategy.positions) == 0
+                              and len(trading_strategy.pending_recovery_close) == 0
+                              and trading_strategy.is_cointegration_trading_allowed(pair_key)
+                              and not trading_strategy.should_block_entry(
+                                  pair_info, latest_kline_timestamp)):
+                            signal = trading_strategy.generate_trading_signal(current_z_score)
+                            signal['z_score'] = current_z_score
+
+                            if signal['action'] != 'HOLD':
+                                print(f"  🔴 交易信号: {signal['description']}")
+
+                                try:
+                                    account_info = binance_api.get_account_info()
+                                    if account_info:
+                                        available_balance = dapi_asset_balance(
+                                            account_info, trading_strategy.settlement_asset
+                                        )
+                                        available_capital = available_balance * trading_strategy.position_ratio
+                                    else:
+                                        available_capital = trading_strategy.current_capital * trading_strategy.position_ratio
+                                except Exception:
+                                    available_capital = trading_strategy.current_capital * trading_strategy.position_ratio
+
+                                # 使用当前对冲比率（RLS或静态）
+                                pair_info_with_rls = pair_info.copy()
+                                pair_info_with_rls['hedge_ratio'] = current_hedge_ratio
+
+                                trading_strategy.execute_trade(pair_info_with_rls, kline_close_prices, signal,
+                                                               latest_kline_timestamp,
+                                                               current_spread, available_capital)
+                                print(f"   开仓执行完成")
+                            else:
+                                print(f"   交易信号: {signal['description']}")
+
+                        print()
+
+                    # 更新已处理的K线时间戳
+                    last_processed_kline_timestamp = latest_kline_timestamp
+
+                # 更新资金曲线
+                trading_strategy.update_capital_curve()
+
+                # 根据K线周期确定检查频率
+                # 在K线收盘前频繁检查，收盘后可以降低频率
+                if warmup_params['interval'] == '1m':
+                    time.sleep(10)  # 1分钟K线，每10秒检查一次
+                elif warmup_params['interval'] == '5m':
+                    time.sleep(10)  # 5分钟K线，每30秒检查一次
+                elif warmup_params['interval'] == '1h':
+                    time.sleep(10)  # 1小时K线，每60秒检查一次
+                else:
+                    time.sleep(30)  # 默认每30秒检查一次
+
+            except Exception as e:
+                print(f"交易循环异常: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(60)
+
+    # 启动交易循环线程
+    trading_thread = threading.Thread(target=trading_loop)
+    trading_thread.daemon = True
+    trading_thread.start()
+
+    try:
+        # 启动Web服务器
+        server.run(host='0.0.0.0', port=5000, debug=False)
+    except KeyboardInterrupt:
+        print("\n停止实盘交易...")
+        trading_strategy.running = False
+        data_manager.stop_data_collection()
+        print("实盘交易已停止")
+
+
+def main():
+    """主函数"""
+    print("币本位交割跨期实盘（dapi：张数/结算币 + 近月到期前强平）")
+    print("实时交易基础设施")
+    print()
+
+    # 执行实盘交易
+    test_live_trading()
+
+
+if __name__ == "__main__":
+    main()
+

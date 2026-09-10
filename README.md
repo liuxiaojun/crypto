@@ -1,5 +1,9 @@
 # crypto
 
+
+## python3 basic_binance_test.py
+测试binance接口  
+
 ## python3 data_functions_download_csv.py
 所有数据已保存到: all_symbols_data_ccxt_20260909_231856.csv 
 包含 24 个币对的数据 

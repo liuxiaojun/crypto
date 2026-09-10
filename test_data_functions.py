@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 独立的数据获取和下载功能测试文件
-直接测试从币安获取真实价格数据和下载功能
+直接测试从币安 U 本位永续（USDⓈ-M Futures）获取 K 线与下载功能
 不依赖Flask服务器
 """
 
@@ -13,14 +13,27 @@ from datetime import datetime, timedelta
 import json
 import time
 import requests
+import ccxt
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# 币安 U 本位永续 K 线（与现货 api/v3/klines 不同源）
+BINANCE_FAPI_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+
+
+def _perp_raw_id_to_ccxt_symbol(raw_id: str) -> str:
+    """如 BTCUSDT -> ccxt.binanceusdm 线性永续 unified symbol BTC/USDT:USDT"""
+    rid = raw_id.upper().replace("/", "")
+    if rid.endswith("USDT") and "_" not in rid:
+        base = rid[:-4]
+        return f"{base}/USDT:USDT"
+    return raw_id
+
 def test_binance_data_fetch():
     """测试从币安获取真实价格数据"""
     print("=" * 60)
-    print("测试1: 从币安获取真实价格数据")
+    print("测试1: 从币安获取 U 本位永续 K 线")
     print("=" * 60)
     
     try:
@@ -30,8 +43,8 @@ def test_binance_data_fetch():
         for symbol in symbols:
             print(f"\n获取 {symbol} 数据...")
             
-            # 从币安API获取K线数据
-            url = "https://api.binance.com/api/v3/klines"
+            # 币安 U 本位永续 fapi K 线
+            url = BINANCE_FAPI_KLINES
             params = {
                 'symbol': symbol,
                 'interval': '1h',
@@ -77,33 +90,66 @@ def test_binance_data_fetch():
         print(f"币安数据获取失败: {str(e)}")
 
 def test_multiple_symbols():
-    """测试获取多个币对数据"""
+    """测试获取多个币对数据 - 支持分段保存"""
     print("\n" + "=" * 60)
-    print("测试2: 获取多个币对数据")
+    print("测试2: 获取多个币对数据（U 本位永续）")
     print("=" * 60)
     
     try:
-        symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
+        symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'AVAXUSDT', 'SOLUSDT','AAVEUSDT','LTCUSDT']
         all_data = {}
         
         for symbol in symbols:
             print(f"\n获取 {symbol} 数据...")
             
-            url = "https://api.binance.com/api/v3/klines"
-            params = {
-                'symbol': symbol,
-                'interval': '1h',
-                'limit': 50
-            }
+            # 币安API单次请求最多1000条，需要分页获取更多数据
+            all_klines = []
+            limit = 1000  # 币安API限制
+            total_limit = 3000  # 期望获取的总数据量
+            max_requests = (total_limit + limit - 1) // limit  # 计算需要的请求次数
             
-            response = requests.get(url, params=params, timeout=10)
+            # 使用币安API官方分页方式
+            start_time = None  # 用于分页的时间戳
             
-            if response.status_code == 200:
-                data = response.json()
+            for i in range(max_requests):
+                print(f"   第 {i+1} 次请求...")
                 
+                url = BINANCE_FAPI_KLINES
+                params = {
+                    'symbol': symbol,
+                    'interval': '1h',
+                    'limit': limit
+                }
+                
+                # 如果不是第一次请求，设置endTime参数来获取更早的数据
+                if start_time is not None:
+                    params['endTime'] = start_time - 1  # 获取endTime之前的数据
+                
+                response = requests.get(url, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if not data:
+                        print(f"   没有更多数据，停止获取")
+                        break
+                    
+                    all_klines.extend(data)
+                    print(f"   获取到 {len(data)} 条数据，总计 {len(all_klines)} 条")
+                    
+                    # 更新start_time为当前批次第一条数据的时间戳，用于下次请求
+                    start_time = data[0][0]  # 第一条数据的时间戳
+                    
+                    # 避免请求过于频繁
+                    time.sleep(0.1)
+                    
+                else:
+                    print(f"   请求失败: HTTP {response.status_code}")
+                    break
+            
+            if all_klines:
                 # 解析数据
                 klines = []
-                for kline in data:
+                for kline in all_klines:
                     klines.append({
                         'timestamp': datetime.fromtimestamp(kline[0] / 1000),
                         'open': float(kline[1]),
@@ -115,16 +161,19 @@ def test_multiple_symbols():
                 
                 df = pd.DataFrame(klines)
                 df.set_index('timestamp', inplace=True)
+                df = df.sort_index()  # 按时间排序
                 all_data[symbol] = df
                 
                 print(f"   成功获取 {len(df)} 条数据")
+                print(f"   时间范围: {df.index[0]} 到 {df.index[-1]}")
                 print(f"   最新价格: {df['close'].iloc[-1]:.4f}")
                 
             else:
-                print(f"   获取失败: HTTP {response.status_code}")
+                print(f"   获取失败: 没有获取到任何数据")
         
         # 保存所有数据到CSV文件
         if all_data:
+            # 保存完整数据
             csv_filename = f"all_symbols_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             
             # 合并所有数据到一个DataFrame
@@ -141,13 +190,251 @@ def test_multiple_symbols():
             print(f"包含 {len(all_data)} 个币对的数据")
             print(f"总数据行数: {len(combined_df)}")
             
+            # 分段保存数据
+            print(f"\n--- 分段保存数据 ---")
+            segments = [2000, 1000]  # 第一段1000条，第二段2000条
+            
+            for segment_index, segment_limit in enumerate(segments):
+                print(f"\n保存第 {segment_index + 1} 段数据（{segment_limit} 条）...")
+                
+                segment_dataframes = []
+                for symbol, df in all_data.items():
+                    # 按时间排序，取最新的数据
+                    df_sorted = df.sort_index()
+                    
+                    # 计算当前段的起始位置
+                    start_idx = sum(segments[:segment_index])  # 前面所有段的总和
+                    end_idx = start_idx + segment_limit
+                    
+                    # 取当前段的数据
+                    df_segment = df_sorted.iloc[start_idx:end_idx].copy()
+                    df_segment['symbol'] = symbol
+                    df_segment['segment'] = f'segment_{segment_index + 1}'
+                    segment_dataframes.append(df_segment)
+                
+                if segment_dataframes:
+                    segment_combined_df = pd.concat(segment_dataframes, ignore_index=False)
+                    segment_filename = f"segment_{segment_index + 1}_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    segment_combined_df.to_csv(segment_filename)
+                    
+                    print(f"   第 {segment_index + 1} 段数据已保存到: {segment_filename}")
+                    print(f"   包含 {len(all_data)} 个币对的数据")
+                    print(f"   总数据行数: {len(segment_combined_df)}")
+                    print(f"   时间范围: {segment_combined_df.index[0]} 到 {segment_combined_df.index[-1]}")
+            
     except Exception as e:
         print(f"多币对数据获取失败: {str(e)}")
+
+def test_multiple_symbols_ccxt():
+    """测试获取多个币对数据 - 使用ccxt库 - 支持分段保存"""
+    print("\n" + "=" * 60)
+    print("测试2-CCXT: 获取多个币对数据（ccxt binanceusdm U 本位永续）")
+    print("=" * 60)
+    
+    try:
+        # 币安 USDⓈ-M 永续（ccxt binanceusdm）
+        exchange = ccxt.binanceusdm({
+            'enableRateLimit': True,  # 启用速率限制
+            'options': {
+                'defaultType': 'future',
+            },
+        })
+        # 13个货币
+        symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'AVAXUSDT', 'SOLUSDT', 'AAVEUSDT', 'LTCUSDT', 'TONUSDT', 'UNIUSDT', 'SUSHIUSDT', 'OPUSDT', 'ARBUSDT', 'COMPUSDT']
+        # 28个货币
+    #     symbols = [
+    #     # 主流Layer1公链
+    #     "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT", "TONUSDT",
+    #
+    #     # Layer2解决方案
+    #     "ARBUSDT", "OPUSDT", "MATICUSDT",
+    #
+    #     # DeFi龙头
+    #     "UNIUSDT", "AAVEUSDT", "CRVUSDT", "COMPUSDT", "MKRUSDT", "SUSHIUSDT",
+    #
+    #     # 老牌公链
+    #     "LTCUSDT", "BCHUSDT", "ETCUSDT",
+    #
+    #     # Meme币
+    #     "DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "FLOKIUSDT",
+    #
+    #     # 隐私币
+    #     "XMRUSDT", "ZECUSDT",
+    #
+    #     # 预言机/Oracle
+    #     "LINKUSDT","BANDUSDT",
+    #
+    #     # BTC
+    #     "BTCUSDT",
+    # ]
+        symbols = [
+
+        # 主流Layer1公链
+        "ETHUSDT", "BNBUSDT", "SOLUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT",
+        "TONUSDT", "NEARUSDT", "APTUSDT", "SUIUSDT", "ICPUSDT", "INJUSDT",
+        "SEIUSDT", "TIAUSDT", "ATOMUSDT", "TRXUSDT", "XRPUSDT", "XLMUSDT",
+        "HBARUSDT",
+
+        # Layer2解决方案
+        "ARBUSDT", "OPUSDT", "POLUSDT", "STXUSDT",
+
+        # DeFi龙头
+        "UNIUSDT", "AAVEUSDT", "CRVUSDT", "LDOUSDT", "JUPUSDT", "CAKEUSDT",
+        "PENDLEUSDT", "ENAUSDT",
+
+        # 老牌公链
+        "LTCUSDT", "BCHUSDT", "ETCUSDT", "FILUSDT",
+
+        # Meme币
+        "DOGEUSDT", "WLDUSDT",
+
+        # 隐私币
+        "XMRUSDT", "ZECUSDT",
+
+        # 预言机/AI/渲染
+        "LINKUSDT", "FETUSDT", "RENDERUSDT", "PYTHUSDT",
+
+        # BTC
+        "BTCUSDT",
+    ]
+
+        all_data = {}
+        
+        for symbol in symbols:
+            print(f"\n获取 {symbol} 数据...")
+            ccxt_symbol = _perp_raw_id_to_ccxt_symbol(symbol)
+
+            # ccxt获取历史数据
+            all_klines = []
+            limit = 1000  # 币安API限制
+            total_limit = 10000  # 期望获取的总数据量
+            max_requests = (total_limit + limit - 1) // limit  # 计算需要的请求次数
+            
+            # 使用ccxt的分页方式获取历史数据
+            # 与原始函数保持一致：使用endTime参数来获取更早的数据
+            end_time = None  # 用于分页的时间戳
+            
+            for i in range(max_requests):
+                print(f"   第 {i+1} 次请求...")
+                
+                try:
+                    # 获取OHLCV数据
+                    if end_time is None:
+                        # 第一次请求，获取最新数据
+                        ohlcv = exchange.fetch_ohlcv(ccxt_symbol, '1h', limit=limit)
+                    else:
+                        # 后续请求，获取更早的数据
+                        # 使用params传递endTime参数（币安API支持endTime来获取更早的数据）
+                        ohlcv = exchange.fetch_ohlcv(ccxt_symbol, '1h', since=None, limit=limit, params={'endTime': end_time - 1})
+                    
+                    if not ohlcv:
+                        print(f"   没有更多数据，停止获取")
+                        break
+                    
+                    # 将新获取的数据添加到列表（更早的数据会排在前面）
+                    all_klines = ohlcv + all_klines
+                    
+                    print(f"   获取到 {len(ohlcv)} 条数据，总计 {len(all_klines)} 条")
+                    
+                    # 更新end_time为当前批次第一条数据的时间戳，用于下次请求
+                    end_time = ohlcv[0][0]  # 第一条数据的时间戳（毫秒）
+                    
+                    # 避免请求过于频繁
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"   请求失败: {str(e)}")
+                    break
+            
+            if all_klines:
+                # 解析数据
+                # ccxt返回的OHLCV格式: [timestamp, open, high, low, close, volume]
+                klines = []
+                for kline in all_klines:
+                    klines.append({
+                        'timestamp': datetime.fromtimestamp(kline[0] / 1000),
+                        'open': float(kline[1]),
+                        'high': float(kline[2]),
+                        'low': float(kline[3]),
+                        'close': float(kline[4]),
+                        'volume': float(kline[5])
+                    })
+                
+                df = pd.DataFrame(klines)
+                df.set_index('timestamp', inplace=True)
+                df = df.sort_index()  # 按时间排序
+                
+                # 字典键与 REST 一致：BTCUSDT 等永续合约 id
+                symbol_key = symbol
+                all_data[symbol_key] = df
+                
+                print(f"   成功获取 {len(df)} 条数据")
+                print(f"   时间范围: {df.index[0]} 到 {df.index[-1]}")
+                print(f"   最新价格: {df['close'].iloc[-1]:.4f}")
+                
+            else:
+                print(f"   获取失败: 没有获取到任何数据")
+        
+        # 保存所有数据到CSV文件
+        if all_data:
+            # 保存完整数据
+            csv_filename = f"all_symbols_data_ccxt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            
+            # 合并所有数据到一个DataFrame
+            all_dataframes = []
+            for symbol, df in all_data.items():
+                df_copy = df.copy()
+                df_copy['symbol'] = symbol
+                all_dataframes.append(df_copy)
+            
+            combined_df = pd.concat(all_dataframes, ignore_index=False)
+            combined_df.to_csv(csv_filename)
+            
+            print(f"\n所有数据已保存到: {csv_filename}")
+            print(f"包含 {len(all_data)} 个币对的数据")
+            print(f"总数据行数: {len(combined_df)}")
+            
+            # 分段保存数据
+            print(f"\n--- 分段保存数据 ---")
+            segments = [5000, 5000]  # 第一段2000条，第二段1000条
+            
+            for segment_index, segment_limit in enumerate(segments):
+                print(f"\n保存第 {segment_index + 1} 段数据（{segment_limit} 条）...")
+                
+                segment_dataframes = []
+                for symbol, df in all_data.items():
+                    # 按时间排序，取最新的数据
+                    df_sorted = df.sort_index()
+                    
+                    # 计算当前段的起始位置
+                    start_idx = sum(segments[:segment_index])  # 前面所有段的总和
+                    end_idx = start_idx + segment_limit
+                    
+                    # 取当前段的数据
+                    df_segment = df_sorted.iloc[start_idx:end_idx].copy()
+                    df_segment['symbol'] = symbol
+                    df_segment['segment'] = f'segment_{segment_index + 1}'
+                    segment_dataframes.append(df_segment)
+                
+                if segment_dataframes:
+                    segment_combined_df = pd.concat(segment_dataframes, ignore_index=False)
+                    segment_filename = f"segment_{segment_index + 1}_data_ccxt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                    segment_combined_df.to_csv(segment_filename)
+                    
+                    print(f"   第 {segment_index + 1} 段数据已保存到: {segment_filename}")
+                    print(f"   包含 {len(all_data)} 个币对的数据")
+                    print(f"   总数据行数: {len(segment_combined_df)}")
+                    print(f"   时间范围: {segment_combined_df.index[0]} 到 {segment_combined_df.index[-1]}")
+            
+    except Exception as e:
+        print(f"多币对数据获取失败（ccxt）: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 def test_different_timeframes():
     """测试不同时间周期的数据获取"""
     print("\n" + "=" * 60)
-    print("测试3: 不同时间周期数据获取")
+    print("测试3: 不同时间周期数据获取（U 本位永续）")
     print("=" * 60)
     
     try:
@@ -157,7 +444,7 @@ def test_different_timeframes():
         for timeframe in timeframes:
             print(f"\n获取 {symbol} {timeframe} 数据...")
             
-            url = "https://api.binance.com/api/v3/klines"
+            url = BINANCE_FAPI_KLINES
             params = {
                 'symbol': symbol,
                 'interval': timeframe,
@@ -202,7 +489,7 @@ def test_different_timeframes():
 def test_large_data_fetch():
     """测试获取大量数据"""
     print("\n" + "=" * 60)
-    print("测试4: 获取大量数据")
+    print("测试4: 获取大量数据（U 本位永续）")
     print("=" * 60)
     
     try:
@@ -217,7 +504,7 @@ def test_large_data_fetch():
         for i in range(max_requests):
             print(f"   第 {i+1} 次请求...")
             
-            url = "https://api.binance.com/api/v3/klines"
+            url = BINANCE_FAPI_KLINES
             params = {
                 'symbol': symbol,
                 'interval': '1h',
@@ -280,7 +567,7 @@ def test_large_data_fetch():
 def test_data_validation():
     """测试数据验证"""
     print("\n" + "=" * 60)
-    print("测试5: 数据验证")
+    print("测试5: 数据验证（U 本位永续）")
     print("=" * 60)
     
     try:
@@ -288,7 +575,7 @@ def test_data_validation():
         print(f"验证 {symbol} 数据质量...")
         
         # 获取数据
-        url = "https://api.binance.com/api/v3/klines"
+        url = BINANCE_FAPI_KLINES
         params = {
             'symbol': symbol,
             'interval': '1h',
@@ -371,7 +658,7 @@ def test_performance():
             start_time = time.time()
             
             # 获取数据
-            url = "https://api.binance.com/api/v3/klines"
+            url = BINANCE_FAPI_KLINES
             params = {
                 'symbol': symbol,
                 'interval': '1h',
@@ -396,17 +683,18 @@ def test_performance():
 
 def main():
     """主测试函数"""
-    print("开始币安数据获取和下载功能测试")
+    print("开始币安 U 本位永续数据获取与下载功能测试")
     print(f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
     # 运行测试
-    test_binance_data_fetch()
-    test_multiple_symbols()
-    test_different_timeframes()
-    test_large_data_fetch()
-    test_data_validation()
-    test_performance()
+    # test_binance_data_fetch()
+    # test_multiple_symbols()
+    test_multiple_symbols_ccxt()
+    # test_different_timeframes()
+    # test_large_data_fetch()
+    # test_data_validation()
+    # test_performance()
     
     print("\n" + "=" * 60)
     print("所有测试完成")

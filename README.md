@@ -46,6 +46,41 @@
 
 重命名 样本内外   （哪一个都可以，样本内外无区分）
 
-## python3 cointegration_windows_RLS_5_zscore_backtest.py
 
-## python3 cointegration_stable_pairs_screening.py
+## python3 cointegration_stable_pairs_screening.py 挑选币对
+Ξ code/crypto git:(main) ▶ python3 cointegration_stable_pairs_screening.py
+稳定协整币对筛选工具  
+====================================================================================================  
+请输入样本内数据文件路径 (例如: 1h_4000_样本内_28.csv): segment_1_data_ccxt_20260910_202837.csv  
+请输入样本外数据文件路径 (例如: 1h_1000_样本外_28.csv): segment_2_data_ccxt_20260910_202837.csv  
+
+请选择价差类型:  
+  0. 原始价差  
+  1. 一阶差分价差  
+请选择 (0/1, 默认0): 0  
+
+请输入筛选参数:  
+最小协整比率 (默认0.2, 即20%):  
+最大对冲比率 (默认100.0):  
+
+将使用以下窗口参数组合:  
+  1. window_size=500, step_size=100  
+  2. window_size=720, step_size=120  
+  3. window_size=240, step_size=120  
+  4. window_size=200, step_size=50  
+  5. window_size=1000, step_size=500  
+
+是否显示详细输出? (y/n, 默认n):  
+====================================================================================================  
+稳定协整币对筛选工具  
+====================================================================================================  
+样本内数据: segment_1_data_ccxt_20260910_202837.csv  
+样本外数据: segment_2_data_ccxt_20260910_202837.csv  
+窗口参数组合数: 5  
+最小协整比率: 0.2  
+最大对冲比率: 100.0  
+价差类型: 原始价差  
+
+
+
+## python3 cointegration_windows_RLS_5_zscore_backtest.py

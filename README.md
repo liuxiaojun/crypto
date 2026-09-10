@@ -1,4 +1,4 @@
-# crypto
+# crypto  用统计套利思路做量化
 
 
 ## python3 basic_binance_test.py

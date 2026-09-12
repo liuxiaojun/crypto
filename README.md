@@ -49,8 +49,7 @@
 
 ## python3 cointegration_stable_pairs_screening.py 挑选币对
 Ξ code/crypto git:(main) ▶ python3 cointegration_stable_pairs_screening.py
-稳定协整币对筛选工具  
-====================================================================================================  
+稳定协整币对筛选工具   
 请输入样本内数据文件路径 (例如: 1h_4000_样本内_28.csv): segment_1_data_ccxt_20260910_202837.csv  
 请输入样本外数据文件路径 (例如: 1h_1000_样本外_28.csv): segment_2_data_ccxt_20260910_202837.csv  
 
@@ -71,9 +70,9 @@
   5. window_size=1000, step_size=500  
 -
 是否显示详细输出? (y/n, 默认n):  
-====================================================================================================  
+
 稳定协整币对筛选工具  
-====================================================================================================  
+
 样本内数据: segment_1_data_ccxt_20260910_202837.csv  
 样本外数据: segment_2_data_ccxt_20260910_202837.csv  
 窗口参数组合数: 5  
@@ -87,4 +86,6 @@
 
 
 
-## python3 cointegration_windows_RLS_5_zscore_backtest.py
+## python3 cointegration_windows_RLS_5_zscore_backtest.py  优化器 
+获取最佳的参数  
+

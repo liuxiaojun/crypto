@@ -4,26 +4,6 @@
 ## python3 basic_binance_test.py
 测试binance接口  
 
-## python3 data_functions_download_csv.py
-所有数据已保存到: all_symbols_data_ccxt_20260909_231856.csv 
-包含 24 个币对的数据 
-总数据行数: 116000 
-
---- 分段保存数据 --- 
-
-保存第 1 段数据（4000 条）... 
-   第 1 段数据已保存到: segment_1_data_ccxt_20260909_231857.csv 
-   包含 24 个币对的数据 
-   总数据行数: 93000 
-   时间范围: 2026-08-20 03:30:00 到 2026-08-20 03:00:00 
-
-保存第 2 段数据（1000 条）... 
-   第 2 段数据已保存到: segment_2_data_ccxt_20260909_231857.csv 
-   包含 24 个币对的数据 
-   总数据行数: 23000 
-   时间范围: 2026-08-20 03:30:00 到 2026-09-09 23:00:00 
-
-
 ## python3 test_data_functions.py
 
 所有数据已保存到: all_symbols_data_ccxt_20260910_202836.csv  
@@ -83,9 +63,7 @@
 结果： 出现窗口的组合数，这个数字越大越好  ，代表重叠的协整性好  
    样本内的协整比例 和 样本外的协整比例 ，选择相对来说稳定的品种 ， 值要大，差异要小  
 
-
-
-
 ## python3 cointegration_windows_RLS_5_zscore_backtest.py  优化器 
 获取最佳的参数  
 
+## python3 live_trading_cointegration_5_zscore_RLS.py 配置实盘
